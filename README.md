@@ -43,17 +43,27 @@ git clone https://github.com/your-username/baidu-autosave.git
 cd baidu-autosave
 ```
 
-2. 安装依赖：
+2. 安装后端依赖：
 ```bash
-pip install -r requirements.txt
+uv python install 3.10
+uv venv --python 3.10 --python-preference only-managed
+uv pip install -r requirements.txt
 ```
 
-3. 运行应用：
+3. 构建前端：
 ```bash
-python web_app.py
+cd frontend
+npm ci
+npm run build:prod
+cd ..
 ```
 
-4. 访问Web界面：
+4. 运行应用：
+```bash
+.venv/bin/python web_app.py
+```
+
+5. 访问Web界面：
 ```
 http://localhost:5000
 ```

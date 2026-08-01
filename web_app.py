@@ -20,6 +20,16 @@ import queue
 
 from gevent.pywsgi import WSGIServer
 
+# Docker 镜像会把前端构建产物复制到 static；本地开发则直接使用 frontend/dist。
+PROJECT_DIR = os.path.dirname(os.path.abspath(__file__))
+PACKAGED_STATIC_DIR = os.path.join(PROJECT_DIR, 'static')
+LOCAL_STATIC_DIR = os.path.join(PROJECT_DIR, 'frontend', 'dist')
+STATIC_DIR = (
+    PACKAGED_STATIC_DIR
+    if os.path.isfile(os.path.join(PACKAGED_STATIC_DIR, 'index.html'))
+    else LOCAL_STATIC_DIR
+)
+
 # GitHub 仓库信息
 GITHUB_REPO = 'kokojacket/baidu-autosave'
 # Docker Hub 信息
@@ -310,7 +320,7 @@ def login():
             return jsonify({'success': False, 'message': '用户名或密码错误'}), 401
             
     # GET请求返回SPA的index.html，让Vue Router处理登录页面
-    return send_from_directory('static', 'index.html')
+    return send_from_directory(STATIC_DIR, 'index.html')
 
 @app.route('/logout')
 def logout():
@@ -323,7 +333,7 @@ def logout():
 @login_required
 def index():
     """首页 - 返回新前端SPA"""
-    return send_from_directory('static', 'index.html')
+    return send_from_directory(STATIC_DIR, 'index.html')
 
 @app.route('/api/tasks', methods=['GET'])
 @login_required
@@ -1476,16 +1486,16 @@ def reorder_task():
 # 静态文件路由
 @app.route('/static/<path:path>')
 def send_static(path):
-    return send_from_directory('static', path)
+    return send_from_directory(STATIC_DIR, path)
 
 # 前端资源路由 - 直接从static目录提供
 @app.route('/assets/<path:path>')
 def send_assets(path):
-    return send_from_directory('static/assets', path)
+    return send_from_directory(os.path.join(STATIC_DIR, 'assets'), path)
 
 @app.route('/favicon/<path:path>')
 def send_favicon(path):
-    return send_from_directory('static/favicon', path)
+    return send_from_directory(os.path.join(STATIC_DIR, 'favicon'), path)
 
 # SPA路由支持 - 捕获所有前端路由
 @app.route('/<path:path>')
@@ -1497,7 +1507,7 @@ def spa_routes(path):
         return jsonify({'success': False, 'message': '接口不存在'}), 404
     
     # 返回SPA的index.html，让Vue Router处理路由
-    return send_from_directory('static', 'index.html')
+    return send_from_directory(STATIC_DIR, 'index.html')
 
 # 错误处理
 @app.errorhandler(404)
@@ -2145,4 +2155,4 @@ if __name__ == '__main__':
         try:
             signal_handler(signal.SIGTERM, None)
         except:
-            sys.exit(1) 
+            sys.exit(1)
