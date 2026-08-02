@@ -1,1043 +1,707 @@
-from apscheduler.schedulers.background import BackgroundScheduler
-from apscheduler.executors.pool import ThreadPoolExecutor
-from apscheduler.jobstores.memory import MemoryJobStore
-from apscheduler.triggers.cron import CronTrigger
-from storage import BaiduStorage
-import json
-import os
-from loguru import logger
-import sys
-from notify import send as notify_send
-from notify import push_config as notify_push_config
-from utils import generate_transfer_notification
+import argparse
+import copy
+import datetime
 import time
 from threading import Lock, Timer
+from urllib.parse import quote
+
 import pytz
-import datetime
-import re
+from apscheduler.executors.pool import ThreadPoolExecutor
+from apscheduler.jobstores.memory import MemoryJobStore
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
+from loguru import logger
+
+from cron_utils import convert_cron_weekday, normalize_cron_expression
+from config_loader import load_config
+from notify import push_config as notify_push_config
+from notify import send as notify_send
+from progress_display import SubscriptionProgress
+from runtime_logging import (
+    SubscriptionLogManager,
+    configure_logging,
+    redact_sensitive_text,
+)
+from runtime_state import RuntimeStateStore
+from storage import BaiduStorage
+from utils import generate_transfer_notification
+
+
+_NOTIFY_DEFAULTS = dict(notify_push_config)
+
 
 class TaskScheduler:
+    """Schedule and execute configured subscriptions through one code path."""
+
     instance = None
-    
-    def __init__(self, storage=None):
-        self._execution_lock = Lock()
+
+    def __init__(
+        self,
+        storage=None,
+        log_manager=None,
+        log_dir_override=None,
+        state_store=None,
+        show_progress=None,
+    ):
         self.storage = storage or BaiduStorage()
-        self.scheduler = None
-        self.is_running = False
-        
-        # 初始化默认调度列表
-        self.default_schedule = self.storage.config.get('cron', {}).get('default_schedule', [])
-        if isinstance(self.default_schedule, str):
-            self.default_schedule = [self.default_schedule]
-        elif not isinstance(self.default_schedule, list):
-            self.default_schedule = []
-        
-        # 添加通知缓冲区和相关变量
-        self._notification_buffer = {
-            'success': [],
-            'failed': [],
-            'skipped': [],
-            'transferred_files': {}
-        }
+        runtime = self.storage.config.get("runtime", {})
+        timezone_name = runtime.get("timezone", "Asia/Shanghai")
+        self.timezone = pytz.timezone(timezone_name)
+        self._show_progress_override = show_progress
+        self.show_progress = (
+            runtime.get("progress", True) if show_progress is None else show_progress
+        )
+        self._log_dir_override = (
+            str(log_dir_override) if log_dir_override is not None else None
+        )
+        self._state_file_override = (
+            str(state_store.path) if state_store is not None else None
+        )
+        self.log_manager = log_manager or SubscriptionLogManager(
+            runtime.get("log_dir", "log")
+        )
+        self.state_store = state_store or RuntimeStateStore(
+            runtime.get("state_file", "state/task_status.json")
+        )
+
+        # 百度转存及配置状态写入按顺序执行。阻塞等待可确保同一时刻触发的订阅
+        # 不会像旧实现那样因抢锁失败而被永久跳过。
+        self._execution_lock = Lock()
         self._notification_lock = Lock()
         self._notification_timer = None
-        self._notification_delay = 30  # 延迟30秒发送通知
-        
-        self._init_scheduler()
+        self._notification_delay = 30
+        self._notification_buffer = self._empty_results()
+
+        self.scheduler = None
+        self.is_running = False
+        self.default_schedule = []
         self._init_notify()
+        self._init_scheduler()
         TaskScheduler.instance = self
-        
+
+    @staticmethod
+    def _empty_results():
+        return {
+            "success": [],
+            "failed": [],
+            "skipped": [],
+            "transferred_files": {},
+        }
+
     def _get_current_tasks(self):
-        """获取当前的任务列表"""
-        try:
-            # 重新加载配置以获取最新任务
-            with open('config/config.json', 'r', encoding='utf-8') as f:
-                config = json.load(f)
-            return config['baidu']['tasks']
-        except Exception as e:
-            logger.error(f"获取任务列表失败: {str(e)}")
-            return []
+        return list(self.storage.config.get("baidu", {}).get("tasks", []))
 
-    def update_tasks(self):
-        """更新所有任务的调度"""
-        try:
-            # 清除现有的任务调度
-            self.scheduler.remove_all_jobs()
-            
-            # 获取任务列表
-            tasks = self.storage.list_tasks()
-            if not tasks:
-                logger.info("没有任务需要调度")
-                return
-            
-            # 获取默认调度设置
-            default_schedule = self.storage.config.get('cron', {}).get('default_schedule', [])
-            if isinstance(default_schedule, str):
-                default_schedule = [default_schedule]
-            elif not isinstance(default_schedule, list):
-                default_schedule = []
-            
-            custom_count = 0
-            default_count = 0
-            
-            # 添加任务调度
-            for task in tasks:
-                if task.get('cron'):  # 自定义定时
-                    self.add_single_task(task)
-                    custom_count += 1
-                else:  # 使用默认定时
-                    if not default_schedule:
-                        logger.warning("存在使用默认定时的任务，但未配置默认定时规则")
-                        continue
-                    
-                    # 为每个默认定时规则添加任务
-                    for schedule in default_schedule:
-                        if schedule and isinstance(schedule, str):  # 确保调度规则有效
-                            self.add_single_task(task, schedule)
-                            default_count += 1
-            
-            logger.info(f"任务调度更新完成: {custom_count} 个自定义定时任务, {default_count} 个默认定时任务")
-            
-        except Exception as e:
-            logger.error(f"更新任务调度失败: {str(e)}")
+    def _get_default_schedules(self):
+        configured = self.storage.config.get("cron", {}).get("default_schedule", [])
+        if isinstance(configured, str):
+            schedules = [part.strip() for part in configured.split(";") if part.strip()]
+        else:
+            schedules = [part.strip() for part in configured if part.strip()]
+        return schedules
 
-    def start(self):
-        """启动调度器"""
-        try:
-            if not self.scheduler:
-                self._init_scheduler()
-            
-            # 直接启动调度器，因为任务已经在_init_scheduler中添加
-            self.scheduler.start()
-            self.is_running = True  # 设置运行状态
-            logger.success("调度器已启动")
-            
-            current_time = datetime.datetime.now(pytz.timezone('Asia/Shanghai'))
-            logger.info(f"当前时间: {current_time.strftime('%Y-%m-%d %H:%M:%S')}")
-            
-        except Exception as e:
-            logger.error(f"启动调度器失败: {str(e)}")
-            raise
+    def _trigger(self, expression):
+        return CronTrigger.from_crontab(
+            normalize_cron_expression(expression), timezone=self.timezone
+        )
+
+    @staticmethod
+    def _job_key(task):
+        task_uid = task.get("task_uid")
+        if task_uid:
+            # Percent-encoding is injective for the complete UID and keeps ':'
+            # available exclusively for the scheduler's own ID components.
+            return f"uid-{quote(str(task_uid), safe='')}"
+        return f"order-{task.get('order')}"
 
     def _init_scheduler(self):
-        """初始化调度器"""
-        try:
-            if self.scheduler and self.scheduler.running:
-                self.scheduler.shutdown(wait=True)
-                self.is_running = False  # 重置运行状态
-            
-            # 从 storage 获取调度器配置
-            scheduler_config = self.storage.config.get('scheduler', {})
-            
-            # 使用单线程执行器
-            executors = {
-                'default': ThreadPoolExecutor(max_workers=scheduler_config.get('max_workers', 1))
-            }
-            
-            # 配置作业存储
-            jobstores = {
-                'default': MemoryJobStore()
-            }
-            
-            # 配置调度器
-            job_defaults = {
-                'coalesce': scheduler_config.get('coalesce', True),  # 堆积的任务只运行一次
-                'max_instances': 1,  # 同一个任务同时只能有一个实例
-                'misfire_grace_time': scheduler_config.get('misfire_grace_time', 3600)  # 错过执行的容错时间
-            }
-            
-            # 创建调度器
-            self.scheduler = BackgroundScheduler(
-                executors=executors,
-                jobstores=jobstores,
-                job_defaults=job_defaults
-            )
-            self.is_running = False  # 初始化时设置为未运行状态
-            
-            # 获取任务列表
-            tasks = self._get_current_tasks()
-            if not tasks:
-                logger.info("没有配置任何任务")
-                return
-            
-            # 获取默认调度并处理多个cron表达式
-            default_schedule = self.storage.config.get('cron', {}).get('default_schedule', '*/5 * * * *')
-            
-            # 处理默认调度配置
-            cron_expressions = []
-            if isinstance(default_schedule, list):
-                # 如果是列表格式，直接使用
-                schedule_list = default_schedule
-            else:
-                # 如果是字符串格式，按分号分割
-                schedule_list = default_schedule.split(';')
-            
-            # 验证每个cron表达式
-            for expr in schedule_list:
-                expr = expr.strip()
-                if not expr:
-                    continue
-                # 验证 cron 表达式格式
-                parts = expr.split()
-                if len(parts) == 5:  # 标准 cron 表达式应该有5个字段
-                    cron_expressions.append(expr)
-                else:
-                    logger.error(f"无效的 cron 表达式 ({expr}): 必须包含5个字段")
-            
-            # 保存验证后的默认调度表达式
-            self.default_schedule = cron_expressions
-            
-            # 分离自定义定时任务和默认定时任务
-            custom_scheduled_tasks = [task for task in tasks if task.get('cron')]
-            default_scheduled_tasks = [task for task in tasks if not task.get('cron')]
-            
-            # 添加自定义定时任务
-            for task in custom_scheduled_tasks:
-                try:
-                    task_order = task.get('order')
-                    if not task_order:
-                        continue
-                        
-                    # 使用统一方法解析cron表达式
-                    self.scheduler.add_job(
-                        self._execute_single_task,
-                        CronTrigger.from_crontab(convert_cron_weekday(task['cron']), timezone=pytz.timezone('Asia/Shanghai')),
-                        args=[task],
-                        id=f'task_{task_order - 1}',
-                        replace_existing=True
-                    )
-                    logger.info(f"已添加自定义定时任务: {task.get('name', f'任务{task_order}')} -> {task['cron']}")
-                except Exception as e:
-                    logger.error(f"添加自定义定时任务失败 ({task.get('name', f'任务{task_order}')}): {str(e)}")
-            
-            # 添加网盘容量检查任务
-            self._add_quota_check_job()
-            
-            # 添加默认定时任务
-            if default_scheduled_tasks:
-                for task in default_scheduled_tasks:
-                    task_order = task.get('order')
-                    if not task_order:
-                        continue
-                        
-                    for i, cron_exp in enumerate(cron_expressions):
-                        try:
-                            self.scheduler.add_job(
-                                self._execute_single_task,
-                                CronTrigger.from_crontab(convert_cron_weekday(cron_exp), timezone=pytz.timezone('Asia/Shanghai')),
-                                args=[task],
-                                id=f'task_{task_order - 1}_{i}',
-                                replace_existing=True
-                            )
-                            logger.info(f"已添加默认定时任务: {task.get('name', f'任务{task_order}')} -> {cron_exp}")
-                        except Exception as e:
-                            logger.error(f"添加默认定时任务失败 ({task.get('name', f'任务{task_order}')}): {str(e)}")
-                            continue
-            
-            logger.info(f"调度器初始化完成: {len(custom_scheduled_tasks)} 个自定义定时任务, {len(default_scheduled_tasks)} 个默认定时任务")
-            
-        except Exception as e:
-            logger.error(f"初始化调度器失败: {str(e)}")
-            raise
+        if self.scheduler and self.scheduler.running:
+            self.scheduler.shutdown(wait=True)
 
-    def _load_config(self):
-        """加载配置文件"""
-        try:
-            with open('config/config.json', 'r', encoding='utf-8') as f:
-                return json.load(f)
-        except Exception as e:
-            logger.error(f"加载配置文件失败: {str(e)}")
-            return None
-            
-    def _save_config(self):
-        """保存配置文件"""
-        try:
-            with open('config/config.json', 'w', encoding='utf-8') as f:
-                json.dump(self.storage.config, f, ensure_ascii=False, indent=4)
-        except Exception as e:
-            logger.error(f"保存配置文件失败: {str(e)}")
-
-    def _execute_task_group(self, tasks=None):
-        """执行任务组 - 这是执行默认定时任务的方法
-        Args:
-            tasks: 要执行的任务列表，如果为None则执行所有默认任务
-        """
-        try:
-            logger.info(f"=== 开始执行定时任务组 === 时间: {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
-            
-            results = {
-                'success': [],
-                'failed': [],
-                'skipped': [],
-                'transferred_files': {}
-            }
-            
-            # 如果没有指定任务列表，获取所有没有自定义cron的任务
-            if tasks is None:
-                tasks = [t for t in self._get_current_tasks() if not t.get('cron')]
-            
-            for task in tasks:
-                try:
-                    task_name = task.get('name', task['url'])
-                    logger.info(f"--- 开始处理任务: {task_name} ---")
-                    
-                    # 用于收集转存的文件
-                    transferred_files = []
-                    
-                    def progress_callback(status, msg):
-                        logger.info(f"转存进度 - {status}: {msg}")
-                        # 从进度消息中提取转存文件信息
-                        if status == 'info' and msg.startswith('添加文件:'):
-                            # 提取完整的文件路径
-                            file_path = msg.replace('添加文件:', '').strip()
-                            # 保持文件的完整路径结构
-                            transferred_files.append(file_path)
-                    
-                    # 执行转存
-                    result = self.storage.transfer_share(
-                        task['url'],
-                        task.get('pwd'),
-                        None,
-                        task.get('save_dir'),
-                        progress_callback,
-                        task  # 传入完整的任务配置
-                    )
-
-                    if result.get('success'):
-                        if result.get('skipped'):
-                            logger.info(f"任务 {task_name} 无需更新（所有文件已存在）")
-                            results['skipped'].append(task)
-                        else:
-                            logger.success(f"任务 {task_name} 执行成功")
-                            results['success'].append(task)
-                            if transferred_files:
-                                # 按目录分组显示文件
-                                files_by_dir = {}
-                                for file_path in transferred_files:
-                                    dir_path = os.path.dirname(file_path)
-                                    if not dir_path:
-                                        dir_path = '/'
-                                    files_by_dir.setdefault(dir_path, []).append(os.path.basename(file_path))
-                                
-                                # 显示分组后的文件
-                                for dir_path, files in files_by_dir.items():
-                                    logger.info(f"转存到 {dir_path}:")
-                                    for file in sorted(files):
-                                        logger.info(f"  - {file}")
-                                
-                                results['transferred_files'][task['url']] = transferred_files
-                    else:
-                        error_msg = result.get('error', '未知错误')
-                        logger.error(f"任务 {task_name} 转存失败：{error_msg}")
-                        results['failed'].append(task)
-
-                except Exception as e:
-                    logger.error(f"执行任务 {task_name} 时发生错误: {str(e)}")
-                    task['error'] = str(e)
-                    results['failed'].append(task)
-            
-            # 将结果添加到通知缓冲区，而不是立即发送通知
-            if results['success'] or results['failed']:
-                self._add_to_notification_buffer(results)
-            
-            logger.info(f"=== 任务组执行完成 === 时间: {time.strftime('%Y-%m-%d %H:%M:%S')} ===")
-            logger.info(f"成功: {len(results['success'])} 个, 跳过: {len(results['skipped'])} 个, 失败: {len(results['failed'])} 个")
-                
-        except Exception as e:
-            logger.error(f"执行任务组失败: {str(e)}")
-
-    def stop(self):
-        """停止调度器"""
-        try:
-            # 取消通知定时器
-            if self._notification_timer:
-                self._notification_timer.cancel()
-                self._notification_timer = None
-            
-            # 发送剩余的通知
-            if self._notification_buffer['success'] or self._notification_buffer['failed']:
-                self._send_buffered_notification()
-            
-            if self.scheduler and self.is_running:
-                self.scheduler.shutdown()
-                self.is_running = False
-                logger.info("调度器已停止")
-            else:
-                logger.info("调度器未在运行")
-        except Exception as e:
-            logger.error(f"停止调度器失败: {str(e)}")
-        finally:
-            self.scheduler = None
-
-    def update_task(self, task_url, cron_exp):
-        """更新任务的调度时间
-        Args:
-            task_url: 任务URL
-            cron_exp: 新的cron表达式
-        """
-        try:
-            # 更新配置文件
-            tasks = self.storage.config.get('baidu', {}).get('tasks', [])
-            for task in tasks:
-                if task.get('url') == task_url:
-                    task['cron'] = cron_exp
-                    task_order = task.get('order')
-                    if task_order:
-                        # 使用统一的任务ID格式
-                        job_id = f"task_{task_order - 1}"
-                        if self.scheduler.get_job(job_id):
-                            self.scheduler.reschedule_job(
-                                job_id,
-                                trigger=CronTrigger.from_crontab(convert_cron_weekday(cron_exp), timezone=pytz.timezone('Asia/Shanghai'))
-                            )
-                            logger.success(f"已更新任务调度: {task_url} -> {cron_exp}")
-                    break
-            self._save_config()
-            
-        except Exception as e:
-            logger.error(f"更新任务调度失败: {str(e)}")
-
-    def update_default_schedule(self, schedules):
-        """更新默认调度规则
-        Args:
-            schedules: 调度规则列表或字符串(多个规则用分号分隔)
-        """
-        try:
-            if isinstance(schedules, str):
-                schedules = [s.strip() for s in schedules.split(';') if s.strip()]
-            
-            # 更新本地变量
-            self.default_schedule = schedules
-            
-            # 更新存储中的配置
-            if 'cron' not in self.storage.config:
-                self.storage.config['cron'] = {}
-            self.storage.config['cron']['default_schedule'] = schedules
-            self._save_config()
-            
-            # 重新调度任务
-            self.update_tasks()
-            logger.info(f"已更新默认调度规则: {schedules}")
-            return True
-        except Exception as e:
-            logger.error(f"更新默认调度规则失败: {str(e)}")
-            return False
-
-    def remove_task(self, task_url):
-        """从调度器中移除任务
-        Args:
-            task_url: 任务URL
-        """
-        try:
-            # 先查找任务的order
-            tasks = self.storage.config.get('baidu', {}).get('tasks', [])
-            task = next((t for t in tasks if t.get('url') == task_url), None)
-            
-            if task and task.get('order'):
-                task_order = task.get('order')
-                base_job_id = f"task_{task_order - 1}"
-                
-                # 移除主任务
-                if self.scheduler.get_job(base_job_id):
-                    self.scheduler.remove_job(base_job_id)
-                
-                # 移除可能存在的默认定时任务(带索引)
-                for i in range(10):  # 假设最多10个默认定时
-                    job_id = f"{base_job_id}_{i}"
-                    if self.scheduler.get_job(job_id):
-                        self.scheduler.remove_job(job_id)
-                
-                logger.success(f"已移除任务: {task_url}")
-            else:
-                logger.warning(f"未找到要移除的任务: {task_url}")
-        except Exception as e:
-            logger.error(f"移除任务失败: {str(e)}")
-
-    def _init_notify(self):
-        """初始化通知配置"""
-        try:
-            notify_config = self.storage.config.get('notify', {})
-            if notify_config and notify_config.get('enabled'):
-                # 更新推送配置
-                from notify import push_config, send as notify_send
-                
-                # 获取通知延迟时间配置
-                self._notification_delay = notify_config.get('notification_delay', 30)
-                logger.info(f"通知延迟时间设置为 {self._notification_delay} 秒")
-                
-                # 将通知配置应用到push_config
-                # 1. 处理直接字段 (新格式)
-                if 'direct_fields' in notify_config:
-                    for key, value in notify_config.get('direct_fields', {}).items():
-                        push_config[key] = value
-                    logger.info("已加载直接通知字段配置")
-                
-                # 2. 处理通道结构 (旧格式，向后兼容)
-                elif 'channels' in notify_config:
-                    for channel, config in notify_config.get('channels', {}).items():
-                        if channel == 'pushplus':
-                            # 设置token
-                            push_config['PUSH_PLUS_TOKEN'] = config.get('token')
-                            # 如果有topic则设置，没有也不影响功能
-                            if 'topic' in config:
-                                push_config['PUSH_PLUS_USER'] = config.get('topic')
-                    logger.info("已加载通道格式的通知配置")
-                
-                # 3. 处理自定义字段 (兼容旧版本)
-                if 'custom_fields' in notify_config:
-                    for key, value in notify_config.get('custom_fields', {}).items():
-                        push_config[key] = value
-                    logger.info("已加载自定义通知字段配置")
-                
-                logger.info("通知配置已加载完成")
-            else:
-                logger.debug("通知功能未启用")
-        except Exception as e:
-            logger.error(f"初始化通知配置失败: {str(e)}")
-
-    def update_notify_config(self, notify_config):
-        """更新通知配置"""
-        if not self.config:
-            self.config = {}
-        self.config['notify'] = notify_config
-        self._save_config()
-        self._init_notify()
-        logger.info("通知配置已更新")
-
-    def _update_task_status(self, task_url, status, error_msg=''):
-        """更新任务状态
-        Args:
-            task_url: 任务URL
-            status: 状态 (success/failed/skipped)
-            error_msg: 错误信息
-        """
-        try:
-            tasks = self.config.get('baidu', {}).get('tasks', [])
-            for task in tasks:
-                if task['url'] == task_url:
-                    task['status'] = status
-                    if error_msg:
-                        task['error'] = error_msg
-                    elif 'error' in task:
-                        del task['error']
-                    break
-            self._save_config()
-        except Exception as e:
-            logger.error(f"更新任务状态失败: {str(e)}")
-
-    def _execute_single_task(self, task):
-        """执行单个任务
-        Args:
-            task: 任务配置
-        """
-        # 使用锁防止同一任务被并发执行
-        if not self._execution_lock.acquire(blocking=False):
-            logger.warning(f"任务已在执行中，跳过此次执行: {task.get('name', task.get('url', '未知任务'))}")
-            return False
-            
-        try:
-            # 获取最新的任务信息，优先使用稳定标识避免 order 变化后串任务
-            tasks = self.storage.config['baidu']['tasks']
-            task_uid = task.get('task_uid') if isinstance(task, dict) else None
-            task_order = task.get('order') if isinstance(task, dict) else None
-
-            current_task = self.storage.get_task_by_uid(task_uid)
-            if current_task is None and task_order:
-                current_task = next((t for t in tasks if t.get('order') == task_order), None)
-
-            if not current_task:
-                lookup = f"task_uid={task_uid}" if task_uid else f"order={task_order}"
-                logger.error(f"未找到任务: {lookup}")
-                return False
-
-            task_order = current_task.get('order')
-            if not task_order:
-                logger.error(f"任务缺少order: {current_task.get('name', current_task.get('url', '未知任务'))}")
-                return False
-            task_id = task_order - 1  # 转换为前端使用的task_id
-            task_name = current_task.get('name', f'任务{task_order}')
-            logger.info(f"开始执行任务: {task_name}")
-            logger.info(f"分享链接: {current_task.get('url', '')}")
-            logger.info(f"保存目录: {current_task.get('save_dir', '')}")
-            logger.info(f"提取码: {current_task.get('pwd', '')}")
-            logger.info("")
-            
-            # 确保存储实例可用
-            if not self.storage.is_valid():
-                logger.warning("存储实例状态异常，尝试刷新登录状态")
-                if not self.storage.refresh_login():
-                    logger.error("刷新登录状态失败")
-                    return False
-
-            # 更新结果字典的结构
-            results = {
-                'success': [],
-                'failed': [],
-                'skipped': [],
-                'transferred_files': {}
-            }
-
-            # 使用最新的任务信息执行
-            def progress_callback(status, message):
-                logger.info(f"[{task_name}] {status}: {message}")
-                if status == 'info' and message.startswith('添加文件:'):
-                    file_path = message.replace('添加文件:', '').strip()
-                    if task_id not in results['transferred_files']:
-                        results['transferred_files'][task['url']] = []  # 使用 url 作为 key
-                    results['transferred_files'][task['url']].append(file_path)
-
-            # 验证必要的任务信息
-            if not current_task.get('url') or not current_task.get('save_dir'):
-                error_msg = "任务缺少必要信息(url或save_dir)"
-                logger.error(error_msg)
-                self.storage.update_task_status_by_order(task_order, 'failed', error_msg)
-                return False
-
-            result = self.storage.transfer_share(
-                current_task['url'],
-                current_task.get('pwd', ''),  # 使用空字符串作为默认值
-                None,
-                current_task['save_dir'],
-                progress_callback,
-                current_task  # 传入完整的任务配置
-            )
-            
-            # 更新任务状态和结果
-            try:
-                if result.get('success'):
-                    if result.get('skipped'):
-                        self.storage.update_task_status_by_order(
-                            task_order,
-                            'skipped',
-                            '没有新文件需要转存'
-                        )
-                    else:
-                        self.storage.update_task_status_by_order(
-                            task_order,
-                            'success',
-                            '转存成功',
-                            transferred_files=result.get('transferred_files', [])
-                        )
-                        # 添加到成功列表
-                        results['success'].append(current_task)
-                        # 更新转存文件列表
-                        if result.get('transferred_files'):
-                            results['transferred_files'][current_task['url']] = result['transferred_files']
-                else:
-                    self.storage.update_task_status_by_order(
-                        task_order,
-                        'failed',
-                        result.get('error', '转存失败')
-                    )
-                    current_task['error'] = result.get('error')
-                    results['failed'].append(current_task)
-                
-                # 将结果添加到通知缓冲区，而不是立即发送通知
-                if results['success'] or results['failed']:
-                    self._add_to_notification_buffer(results)
-                
-                return result.get('success', False)
-                
-            except Exception as e:
-                logger.error(f"更新任务状态失败: {str(e)}")
-                return False
-            
-        except Exception as e:
-            logger.error(f"执行任务失败: {str(e)}")
-            try:
-                self.storage.update_task_status_by_order(task_order, 'failed', str(e))
-                # 添加失败通知到缓冲区
-                results = {
-                    'success': [],
-                    'failed': [task],
-                    'transferred_files': {}
-                }
-                self._add_to_notification_buffer(results)
-            except:
-                pass
-            return False
-        finally:
-            # 释放锁
-            self._execution_lock.release()
-
-    def _add_to_notification_buffer(self, results):
-        """将任务结果添加到通知缓冲区
-        Args:
-            results: 任务执行结果
-        """
-        with self._notification_lock:
-            # 合并成功任务
-            self._notification_buffer['success'].extend(results['success'])
-            
-            # 合并失败任务
-            self._notification_buffer['failed'].extend(results['failed'])
-            
-            # 合并跳过任务
-            self._notification_buffer['skipped'].extend(results.get('skipped', []))
-            
-            # 合并转存文件
-            for url, files in results['transferred_files'].items():
-                if url not in self._notification_buffer['transferred_files']:
-                    self._notification_buffer['transferred_files'][url] = []
-                self._notification_buffer['transferred_files'][url].extend(files)
-            
-            # 取消现有的定时器
-            if self._notification_timer:
-                self._notification_timer.cancel()
-            
-            # 创建新的定时器，延迟发送通知
-            self._notification_timer = Timer(self._notification_delay, self._send_buffered_notification)
-            self._notification_timer.daemon = True  # 设置为守护线程，避免阻止程序退出
-            self._notification_timer.start()
-            
-            logger.info(f"已将任务结果添加到通知缓冲区，将在 {self._notification_delay} 秒后发送通知")
-
-    def _send_buffered_notification(self):
-        """发送缓冲区中的通知"""
-        with self._notification_lock:
-            if not (self._notification_buffer['success'] or self._notification_buffer['failed']):
-                logger.info("通知缓冲区为空，无需发送通知")
-                return
-            
-            try:
-                notification_content = generate_transfer_notification(self._notification_buffer)
-                if notification_content.strip():  # 只在有内容时发送通知
-                    logger.info(f"准备发送汇总通知:\n{notification_content}")
-                    notify_send("百度网盘自动追更", notification_content)
-                    logger.info(f"通知发送成功，共 {len(self._notification_buffer['success'])} 个成功任务，{len(self._notification_buffer['failed'])} 个失败任务")
-                else:
-                    logger.warning("生成的通知内容为空，跳过发送")
-            except Exception as e:
-                logger.error(f"发送汇总通知失败: {str(e)}")
-            finally:
-                # 清空缓冲区
-                self._notification_buffer = {
-                    'success': [],
-                    'failed': [],
-                    'skipped': [],
-                    'transferred_files': {}
-                }
-                self._notification_timer = None
-
-    def _resolve_task_reference(self, task_ref):
-        """按 task_uid/order/url 解析任务，兼容旧调用。"""
-        current_task = self.storage.resolve_task(task_ref)
-        if current_task is not None:
-            return current_task
-
-        if isinstance(task_ref, dict):
-            return None
-
-        return self.storage.resolve_task(url=task_ref)
-
-    def update_task_schedule(self, task_ref, cron_exp=None):
-        """更新任务调度"""
-        try:
-            current_task = self._resolve_task_reference(task_ref)
-
-            if not current_task:
-                logger.error(f"未找到任务: {task_ref}")
-                return False
-
-            task_order = current_task.get('order')
-            if not task_order:
-                logger.error(f"任务缺少order: {current_task.get('task_uid') or current_task.get('url')}")
-                return False
-
-            task_id = f'task_{task_order - 1}'  # 转换为前端使用的task_id
-
-            # 移除旧任务
-            if self.scheduler.get_job(task_id):
-                self.scheduler.remove_job(task_id)
-
-            # 使用新的cron表达式或保持原值
-            final_cron = cron_exp if cron_exp is not None else current_task.get('cron')
-
-            if final_cron:
-                try:
-                    self.scheduler.add_job(
-                        self._execute_single_task,
-                        CronTrigger.from_crontab(convert_cron_weekday(final_cron)),
-                        args=[current_task],
-                        id=task_id,
-                        replace_existing=True
-                    )
-                    logger.info(
-                        f"已更新任务调度: {current_task.get('task_uid', current_task.get('url'))} "
-                        f"(task_id={task_order}) -> {final_cron}"
-                    )
-                except Exception as e:
-                    logger.error(f"更新任务调度失败: {str(e)}")
-                    return False
-            else:
-                logger.info(
-                    f"任务 {current_task.get('task_uid', current_task.get('url'))} 切换到默认定时，正在更新调度..."
+        scheduler_config = self.storage.config.get("scheduler", {})
+        self.scheduler = BackgroundScheduler(
+            executors={
+                "default": ThreadPoolExecutor(
+                    max_workers=scheduler_config.get("max_workers", 1)
                 )
-                self.update_tasks()  # 重新加载所有任务的调度
+            },
+            jobstores={"default": MemoryJobStore()},
+            job_defaults={
+                "coalesce": scheduler_config.get("coalesce", True),
+                "max_instances": scheduler_config.get("max_instances", 1),
+                "misfire_grace_time": scheduler_config.get(
+                    "misfire_grace_time", 3600
+                ),
+            },
+            timezone=self.timezone,
+        )
+        self.is_running = False
+        self.default_schedule = self._get_default_schedules()
 
-            return True
-
-        except Exception as e:
-            logger.error(f"更新任务调度失败: {str(e)}")
-            return False
-
-    def sync_task_info(self, task_ref):
-        """同步任务信息
-        Args:
-            task_ref: 任务引用（优先 task_uid，兼容 URL/order/任务对象）
-        Returns:
-            bool: 是否成功
-        """
-        try:
-            current_task = self._resolve_task_reference(task_ref)
-
-            if not current_task:
-                logger.error(f"未找到任务: {task_ref}")
-                return False
-
-            # 更新任务调度
-            return self.update_task_schedule(current_task, current_task.get('cron'))
-
-        except Exception as e:
-            logger.error(f"同步任务信息失败: {str(e)}")
-            return False
-
-    def add_single_task(self, task, schedule=None):
-        """添加单个任务的调度
-        Args:
-            task: 任务配置
-            schedule: 可选的定时规则，用于默认定时
-        """
-        try:
-            cron_schedule = schedule or task.get('cron')
-            if not cron_schedule:
-                return
-                
-            task_order = task.get('order')
-            if not task_order:
-                logger.error(f"任务缺少order: {task.get('name', task.get('url', '未知任务'))}")
-                return
-                
-            task_id = task_order - 1
-            
-            try:
-                # 使用统一方法解析cron表达式
-                trigger = CronTrigger.from_crontab(convert_cron_weekday(cron_schedule), timezone=pytz.timezone('Asia/Shanghai'))
-
-                # 为默认定时任务添加索引
-                job_id = f'task_{task_id}'
-                if schedule:  # 使用默认定时
-                    # 查找已有的默认定时任务数量
-                    count = 0
-                    while self.scheduler.get_job(f'{job_id}_{count}'):
-                        count += 1
-                    job_id = f'{job_id}_{count}'
-                
+        custom_count = 0
+        default_job_count = 0
+        for task in sorted(
+            self._get_current_tasks(), key=lambda item: item.get("order", float("inf"))
+        ):
+            task_key = self._job_key(task)
+            custom_schedule = task.get("cron")
+            if custom_schedule:
                 self.scheduler.add_job(
                     self._execute_single_task,
-                    trigger,
+                    self._trigger(custom_schedule),
                     args=[task],
-                    id=job_id,
-                    replace_existing=True
+                    id=f"subscription:{task_key}",
+                    replace_existing=True,
                 )
-                
-                # 根据schedule参数判断是默认定时还是自定义定时
-                schedule_type = "默认定时" if schedule else "自定义定时"
-                logger.info(f"已添加{schedule_type}任务: {task.get('name', task.get('url', f'任务{task_order}'))}, 调度: {cron_schedule}")
-            except Exception as e:
-                logger.error(f"解析cron表达式失败 '{cron_schedule}': {str(e)}")
-        except Exception as e:
-            logger.error(f"添加任务调度失败 ({task.get('name', task.get('url', '未知任务'))}): {str(e)}")
+                custom_count += 1
+                logger.info(
+                    "已添加自定义定时订阅: {} -> {}",
+                    task.get("name") or task.get("url"),
+                    custom_schedule,
+                )
+                continue
+
+            for index, schedule in enumerate(self.default_schedule):
+                self.scheduler.add_job(
+                    self._execute_single_task,
+                    self._trigger(schedule),
+                    args=[task],
+                    id=f"subscription:{task_key}:default:{index}",
+                    replace_existing=True,
+                )
+                default_job_count += 1
+                logger.info(
+                    "已添加默认定时订阅: {} -> {}",
+                    task.get("name") or task.get("url"),
+                    schedule,
+                )
+
+        self._add_quota_check_job()
+        logger.info(
+            "调度器初始化完成: {} 个自定义任务, {} 个默认调度实例",
+            custom_count,
+            default_job_count,
+        )
+
+    def start(self):
+        if self.scheduler is None:
+            self._init_scheduler()
+        if self.scheduler.running:
+            return
+        self.scheduler.start()
+        self.is_running = True
+        now = datetime.datetime.now(self.timezone)
+        logger.success(
+            "调度器已启动 | 时区={} | 当前时间={}",
+            self.timezone.zone,
+            now.strftime("%Y-%m-%d %H:%M:%S"),
+        )
+
+    def stop(self, wait=True):
+        if self._notification_timer:
+            self._notification_timer.cancel()
+            self._notification_timer = None
+
+        if self.scheduler and self.scheduler.running:
+            self.scheduler.shutdown(wait=wait)
+        self.is_running = False
+        self.flush_notifications()
+        if TaskScheduler.instance is self:
+            TaskScheduler.instance = None
+        logger.info("调度器已停止")
+
+    def reload(self):
+        """Reload a fully validated configuration and rebuild all jobs."""
+        # Validate before stopping the active scheduler. Invalid edits are rejected
+        # while the last known-good schedule continues to run.
+        validated_config = load_config(self.storage.config_path)
+        old_config = copy.deepcopy(self.storage.config)
+        old_client = self.storage.client
+        old_timezone = self.timezone
+        old_show_progress = self.show_progress
+        old_log_manager = self.log_manager
+        old_state_store = self.state_store
+        was_running = bool(self.scheduler and self.scheduler.running)
+        if was_running:
+            self.scheduler.shutdown(wait=True)
+            self.is_running = False
+        self.flush_notifications()
+
+        try:
+            self.storage.reload_config(
+                initialize_client=True,
+                config=validated_config,
+                persist_generated_uids=False,
+            )
+            runtime = self.storage.config.get("runtime", {})
+            self.timezone = pytz.timezone(
+                runtime.get("timezone", "Asia/Shanghai")
+            )
+            self.show_progress = (
+                runtime.get("progress", True)
+                if self._show_progress_override is None
+                else self._show_progress_override
+            )
+            log_dir = self._log_dir_override or runtime.get("log_dir", "log")
+            configure_logging(
+                log_dir,
+                level=runtime.get("log_level", "INFO"),
+                retention_days=runtime.get("general_log_retention_days", 14),
+            )
+            self.log_manager = SubscriptionLogManager(log_dir)
+            self.state_store = RuntimeStateStore(
+                self._state_file_override
+                or runtime.get("state_file", "state/task_status.json")
+            )
+            self._init_notify()
+            self._init_scheduler()
+            if was_running:
+                self.start()
+            # Persist generated task UIDs only after every runtime component was
+            # applied successfully. A failed reload must not alter the edited file.
+            self.storage._save_config(update_scheduler=False)
+            logger.success("配置已重新加载并通过完整校验")
+        except Exception:
+            # Keep the last known-good in-memory configuration operational. The
+            # edited file is left untouched so the user can correct and retry it.
+            self.storage.config = old_config
+            self.storage.client = old_client
+            self.timezone = old_timezone
+            self.show_progress = old_show_progress
+            self.log_manager = old_log_manager
+            self.state_store = old_state_store
+            old_runtime = old_config.get("runtime", {})
+            old_log_dir = self._log_dir_override or old_runtime.get("log_dir", "log")
+            configure_logging(
+                old_log_dir,
+                level=old_runtime.get("log_level", "INFO"),
+                retention_days=old_runtime.get("general_log_retention_days", 14),
+            )
+            self._init_notify()
+            self._init_scheduler()
+            if was_running:
+                self.start()
+            logger.exception("配置应用失败，已恢复上一份可运行配置")
+            raise
+
+    def update_tasks(self):
+        was_running = bool(self.scheduler and self.scheduler.running)
+        self._init_scheduler()
+        if was_running:
+            self.start()
+
+    def _init_notify(self):
+        notify_config = self.storage.config.get("notify", {})
+        self._notification_delay = notify_config.get("notification_delay", 30)
+
+        # 重载时先恢复模块初始值，防止已删除的渠道凭据继续生效。
+        notify_push_config.clear()
+        notify_push_config.update(_NOTIFY_DEFAULTS)
+        if not notify_config.get("enabled", False):
+            logger.info("通知功能未启用")
+            return
+
+        direct_fields = notify_config.get("direct_fields")
+        if isinstance(direct_fields, dict):
+            notify_push_config.update(direct_fields)
+        elif isinstance(notify_config.get("channels"), dict):
+            pushplus = notify_config["channels"].get("pushplus", {})
+            if pushplus:
+                notify_push_config["PUSH_PLUS_TOKEN"] = pushplus.get("token", "")
+                notify_push_config["PUSH_PLUS_USER"] = pushplus.get("topic", "")
+
+        custom_fields = notify_config.get("custom_fields", {})
+        if isinstance(custom_fields, dict):
+            notify_push_config.update(custom_fields)
+        logger.info("通知配置已加载，合并延迟={} 秒", self._notification_delay)
+
+    def update_notify_config(self, notify_config):
+        self.storage.config["notify"] = notify_config
+        self.storage._save_config(update_scheduler=False)
+        self._init_notify()
+
+    def _progress_callback(self, task, progress):
+        task_name = task.get("name") or task.get("url")
+
+        def callback(status, message):
+            level = {
+                "error": "ERROR",
+                "warning": "WARNING",
+                "success": "SUCCESS",
+                "debug": "DEBUG",
+            }.get(str(status).lower(), "INFO")
+            logger.log(level, "[{}] {}", task_name, message)
+            progress.update(status, message)
+
+        return callback
+
+    def _resolve_task_reference(self, task_ref):
+        task = self.storage.resolve_task(task_ref)
+        if task is not None:
+            return task
+        if isinstance(task_ref, str):
+            matches = [
+                item
+                for item in self._get_current_tasks()
+                if item.get("name") == task_ref
+            ]
+            if len(matches) == 1:
+                return matches[0]
+        return None
+
+    def execute_task(self, task_ref, buffer_notification=True):
+        """Execute one subscription and return its complete structured result."""
+        task = self._resolve_task_reference(task_ref)
+        if task is None:
+            return {
+                "success": False,
+                "error": f"未找到订阅: {redact_sensitive_text(task_ref)}",
+            }
+
+        with self.log_manager.capture(task) as log_path:
+            with SubscriptionProgress(task, enabled=self.show_progress) as progress:
+                if self._execution_lock.locked():
+                    logger.info("已有订阅正在执行，本订阅将按顺序等待")
+
+                with self._execution_lock:
+                    # 等待期间配置可能已重载；稳定标识优先，避免 order 变化后串任务。
+                    if task.get("task_uid"):
+                        current_task = self.storage.resolve_task(
+                            task_uid=task["task_uid"]
+                        )
+                    else:
+                        current_task = self.storage.resolve_task(
+                            order=task.get("order"),
+                            url=task.get("url"),
+                        )
+                    if current_task is None:
+                        result = {
+                            "success": False,
+                            "error": "订阅在执行前已被移除",
+                            "task_uid": task.get("task_uid"),
+                            "order": task.get("order"),
+                            "name": task.get("name") or task.get("url"),
+                            "outcome": "失败",
+                            "log_path": str(log_path),
+                        }
+                        logger.error(result["error"])
+                        progress.finish("失败")
+                        return result
+
+                    task_order = current_task.get("order")
+                    task_name = current_task.get("name") or f"订阅 {task_order}"
+                    logger.info("开始执行订阅: {}", task_name)
+                    logger.info("分享链接: {}", current_task.get("url"))
+                    logger.info("保存目录: {}", current_task.get("save_dir"))
+                    logger.info(
+                        "提取码: {}",
+                        "已配置（已隐藏）" if current_task.get("pwd") else "未配置",
+                    )
+
+                    if not current_task.get("url") or not current_task.get("save_dir"):
+                        result = {"success": False, "error": "订阅缺少 url 或 save_dir"}
+                    else:
+                        self.state_store.update(
+                            current_task,
+                            "running",
+                            "正在执行订阅",
+                            log_path=log_path,
+                        )
+                        try:
+                            result = self.storage.transfer_share(
+                                current_task["url"],
+                                current_task.get("pwd"),
+                                None,
+                                current_task["save_dir"],
+                                self._progress_callback(current_task, progress),
+                                current_task,
+                            )
+                        except Exception as exc:
+                            logger.exception("订阅执行发生未处理异常: {}", exc)
+                            result = {"success": False, "error": str(exc)}
+
+                    notification_results = self._empty_results()
+                    if result.get("success") and result.get("skipped"):
+                        self.state_store.update(
+                            current_task,
+                            "skipped",
+                            "没有新文件需要转存",
+                            log_path=log_path,
+                        )
+                        notification_results["skipped"].append(current_task)
+                        outcome = "跳过"
+                        logger.info("订阅无需更新: {}", task_name)
+                    elif result.get("success"):
+                        transferred_files = result.get("transferred_files", [])
+                        self.state_store.update(
+                            current_task,
+                            "success",
+                            result.get("message", "转存成功"),
+                            log_path=log_path,
+                            transferred_files=transferred_files,
+                        )
+                        notification_results["success"].append(current_task)
+                        notification_results["transferred_files"][
+                            current_task["url"]
+                        ] = transferred_files
+                        outcome = "成功"
+                        logger.success(
+                            "订阅执行成功: {} | 转存/重命名文件数={}",
+                            task_name,
+                            len(transferred_files),
+                        )
+                    else:
+                        error = redact_sensitive_text(
+                            result.get("error", "未知错误")
+                        )
+                        result = dict(result)
+                        result["error"] = error
+                        self.state_store.update(
+                            current_task,
+                            "failed",
+                            error,
+                            log_path=log_path,
+                            error=error,
+                        )
+                        failed_task = dict(current_task)
+                        failed_task["error"] = error
+                        notification_results["failed"].append(failed_task)
+                        outcome = "失败"
+                        logger.error("订阅执行失败: {} | {}", task_name, error)
+
+                    if buffer_notification:
+                        self._add_to_notification_buffer(notification_results)
+                    progress.finish(outcome)
+
+                    final_result = dict(result)
+                    final_result.update(
+                        {
+                            "task_uid": current_task.get("task_uid"),
+                            "order": task_order,
+                            "name": task_name,
+                            "outcome": outcome,
+                            "log_path": str(log_path),
+                        }
+                    )
+                    return final_result
+
+    def _execute_single_task(self, task):
+        result = self.execute_task(task, buffer_notification=True)
+        return bool(result.get("success"))
+
+    def execute_tasks(self, tasks=None, flush_notifications=False):
+        selected = tasks if tasks is not None else self._get_current_tasks()
+        selected = sorted(selected, key=lambda item: item.get("order", float("inf")))
+        results = [self.execute_task(task) for task in selected]
+        if flush_notifications:
+            self.flush_notifications()
+        return results
+
+    def _execute_task_group(self, tasks=None):
+        """Backward-compatible group entry using the unified executor."""
+        return self.execute_tasks(tasks=tasks, flush_notifications=False)
+
+    def _add_to_notification_buffer(self, results):
+        if not self.storage.config.get("notify", {}).get("enabled", False):
+            logger.debug("通知未启用，不写入通知缓冲区")
+            return
+        if not (results["success"] or results["failed"]):
+            return
+
+        with self._notification_lock:
+            self._notification_buffer["success"].extend(results["success"])
+            self._notification_buffer["failed"].extend(results["failed"])
+            self._notification_buffer["skipped"].extend(results.get("skipped", []))
+            for url, files in results["transferred_files"].items():
+                self._notification_buffer["transferred_files"].setdefault(url, []).extend(
+                    files
+                )
+
+            if self._notification_timer:
+                self._notification_timer.cancel()
+                self._notification_timer = None
+            send_immediately = self._notification_delay == 0
+            if not send_immediately:
+                self._notification_timer = Timer(
+                    self._notification_delay, self.flush_notifications
+                )
+                self._notification_timer.daemon = True
+                self._notification_timer.start()
+        if send_immediately:
+            logger.info("通知合并延迟为 0，立即发送本次汇总")
+            self.flush_notifications()
+        else:
+            logger.info("通知结果已入队，将在 {} 秒后汇总发送", self._notification_delay)
+
+    def flush_notifications(self):
+        with self._notification_lock:
+            if self._notification_timer:
+                self._notification_timer.cancel()
+                self._notification_timer = None
+            if not (
+                self._notification_buffer["success"]
+                or self._notification_buffer["failed"]
+            ):
+                return False
+            buffered = self._notification_buffer
+            self._notification_buffer = self._empty_results()
+
+        if not self.storage.config.get("notify", {}).get("enabled", False):
+            return False
+        try:
+            content = generate_transfer_notification(buffered)
+            if content.strip():
+                notify_send("百度网盘自动追更", content)
+                logger.success(
+                    "汇总通知发送流程已完成: 成功={} 失败={}",
+                    len(buffered["success"]),
+                    len(buffered["failed"]),
+                )
+                return True
+            logger.warning("通知内容为空，未发送")
+            return False
+        except Exception as exc:
+            logger.exception("发送汇总通知失败: {}", exc)
+            return False
+
+    def update_task(self, task_url, cron_exp):
+        task = self.storage.resolve_task(url=task_url)
+        if task is None:
+            logger.error("未找到订阅: {}", task_url)
+            return False
+        task["cron"] = cron_exp
+        self.storage._save_config(update_scheduler=False)
+        self.update_tasks()
+        return True
+
+    def update_default_schedule(self, schedules):
+        if isinstance(schedules, str):
+            schedules = [part.strip() for part in schedules.split(";") if part.strip()]
+        self.storage.config.setdefault("cron", {})["default_schedule"] = schedules
+        self.storage._save_config(update_scheduler=False)
+        self.update_tasks()
+        return True
+
+    def remove_task(self, task_url):
+        removed = self.storage.remove_task(task_url)
+        if removed:
+            self.update_tasks()
+        return removed
+
+    def update_task_schedule(self, task_ref, cron_exp=None):
+        task = self._resolve_task_reference(task_ref)
+        if task is None:
+            return False
+        if cron_exp is not None:
+            if cron_exp:
+                task["cron"] = cron_exp
+            else:
+                task.pop("cron", None)
+            self.storage._save_config(update_scheduler=False)
+        self.update_tasks()
+        return True
+
+    def sync_task_info(self, task_ref):
+        return self.update_task_schedule(task_ref)
+
+    def add_single_task(self, task, schedule=None):
+        # Configuration is authoritative; rebuilding avoids stale or duplicate jobs.
+        self.update_tasks()
 
     def _add_quota_check_job(self):
-        """添加网盘容量检查任务"""
-        try:
-            # 获取容量检查配置
-            quota_alert = self.storage.config.get('quota_alert', {})
-            if not quota_alert.get('enabled', False):
-                logger.info("网盘容量检查功能未启用")
-                return
-            
-            # 获取检查时间表达式，默认每天00:00
-            check_schedule = quota_alert.get('check_schedule', '0 0 * * *')
-            
-            # 添加定时任务
-            self.scheduler.add_job(
-                self._check_disk_quota,
-                CronTrigger.from_crontab(convert_cron_weekday(check_schedule), timezone=pytz.timezone('Asia/Shanghai')),
-                id='quota_check',
-                replace_existing=True
+        quota_alert = self.storage.config.get("quota_alert", {})
+        if not quota_alert.get("enabled", False):
+            return
+        schedule = quota_alert.get("check_schedule", "0 0 * * *")
+        self.scheduler.add_job(
+            self._check_disk_quota,
+            self._trigger(schedule),
+            id="quota-check",
+            replace_existing=True,
+        )
+        logger.info("已添加网盘容量检查: {}", schedule)
+
+    def check_disk_quota(self, send_notification=True):
+        if self.storage.client is None and not self.storage._init_client():
+            raise RuntimeError("百度网盘客户端未登录或初始化失败")
+        user_info = self.storage.get_user_info()
+        if not user_info or "quota" not in user_info:
+            raise RuntimeError("无法获取百度网盘容量信息")
+
+        quota = user_info["quota"]
+        total = quota.get("total", 0)
+        used = quota.get("used", 0)
+        if total <= 0:
+            raise RuntimeError("网盘总容量必须大于 0")
+
+        used_percent = round(used / total * 100, 2)
+        total_gb = round(total / (1024**3), 2)
+        used_gb = round(used / (1024**3), 2)
+        quota_config = self.storage.config.get("quota_alert", {})
+        threshold = quota_config.get("threshold_percent", 90)
+        exceeded = used_percent >= threshold
+        result = {
+            "user": user_info.get("user_name")
+            or self.storage.config["baidu"].get("current_user"),
+            "total_bytes": total,
+            "used_bytes": used,
+            "total_gb": total_gb,
+            "used_gb": used_gb,
+            "used_percent": used_percent,
+            "threshold_percent": threshold,
+            "exceeded": exceeded,
+        }
+        logger.info(
+            "网盘容量: {}/{} GB ({}%) | 阈值={} %",
+            used_gb,
+            total_gb,
+            used_percent,
+            threshold,
+        )
+
+        notify_enabled = self.storage.config.get("notify", {}).get("enabled", False)
+        if exceeded and send_notification and notify_enabled:
+            content = (
+                "## 网盘容量不足\n\n"
+                f"**用户**: {result['user']}  \n"
+                f"**已使用**: {used_gb}GB / {total_gb}GB  \n"
+                f"**使用比例**: {used_percent}%  \n"
+                f"**警告阈值**: {threshold}%"
             )
-            logger.info(f"已添加网盘容量检查任务: {check_schedule}")
-        except Exception as e:
-            logger.error(f"添加网盘容量检查任务失败: {str(e)}")
+            notify_send(f"网盘容量不足 - {result['user']}", content)
+            logger.warning("网盘容量告警发送流程已完成")
+        elif exceeded:
+            logger.warning("网盘容量已超过阈值，但通知未启用或本次禁止发送")
+        return result
 
     def _check_disk_quota(self):
-        """检查网盘容量并发送通知"""
         try:
-            logger.info("开始检查网盘容量")
-            
-            # 确保存储对象有效
-            if not self.storage or not self.storage.is_valid():
-                logger.error("存储对象无效或未登录")
-                return
-            
-            # 获取用户信息和配额
-            user_info = self.storage.get_user_info()
-            if not user_info or 'quota' not in user_info:
-                logger.error("无法获取用户配额信息")
-                return
-            
-            # 获取配额信息
-            quota = user_info['quota']
-            total = quota.get('total', 0)
-            used = quota.get('used', 0)
-            
-            if total <= 0:
-                logger.error("获取到的总容量为0，无法计算使用比例")
-                return
-            
-            # 计算使用比例
-            used_percent = round(used / total * 100, 2)
-            
-            # 转换为GB并保留2位小数
-            total_gb = round(total / (1024**3), 2)
-            used_gb = round(used / (1024**3), 2)
-            
-            # 获取阈值
-            quota_alert = self.storage.config.get('quota_alert', {})
-            threshold = quota_alert.get('threshold_percent', 90)
-            
-            # 记录日志
-            logger.info(f"网盘容量检查: 已使用 {used_gb}GB/{total_gb}GB ({used_percent}%), 阈值: {threshold}%")
-            
-            # 检查是否超过阈值
-            if used_percent >= threshold:
-                # 获取用户名
-                username = user_info.get('user_name', self.storage.config['baidu'].get('current_user', '未知用户'))
-                
-                # 构建通知内容
-                title = f"网盘容量不足 - {username}"
-                content = f"""
-## 网盘容量不足
+            self.check_disk_quota(send_notification=True)
+            return True
+        except Exception as exc:
+            logger.exception("检查网盘容量失败: {}", exc)
+            return False
 
-**用户**: {username}  
-**已使用**: {used_gb}GB / {total_gb}GB  
-**使用比例**: {used_percent}%  
-**警告阈值**: {threshold}%  
 
-您的百度网盘空间使用量已超过设定阈值，请及时清理不必要的文件，以免影响正常使用。
-"""
-                
-                # 直接发送容量警告通知，不使用缓冲区
-                # 因为容量警告是独立的重要通知，不应与普通任务通知合并
-                notify_send(title, content)
-                logger.warning(f"已发送网盘容量警告通知: {used_percent}% >= {threshold}%")
-            else:
-                logger.info(f"网盘容量正常: {used_percent}% < {threshold}%")
-                
-        except Exception as e:
-            logger.error(f"检查网盘容量失败: {str(e)}")
+def main(argv=None):
+    parser = argparse.ArgumentParser(description="百度网盘订阅调度器（兼容入口）")
+    parser.add_argument("action", choices=["start", "run-all"])
+    parser.add_argument("--config", default="config/config.json")
+    args = parser.parse_args(argv)
 
-def convert_cron_weekday(cron_exp):
-    """
-    转换cron表达式中的星期几字段，适配APScheduler的映射规则
-    标准cron: 0或7=周日, 1=周一, ..., 6=周六
-    APScheduler: 0=周一, 1=周二, ..., 6=周日
-    
-    转换规则:
-    - 使用英文简写 (sun, mon, tue, wed, thu, fri, sat) 不变
-    - 数字 0 转为 6 (周日)
-    - 数字 7 转为 6 (周日)
-    - 数字 1-6 转为 0-5 (周一到周六，减1)
-    """
-    if not cron_exp or not isinstance(cron_exp, str):
-        return cron_exp
-        
-    parts = cron_exp.strip().split()
-    if len(parts) != 5:  # 标准cron表达式有5个字段
-        return cron_exp
-        
-    dow_field = parts[4]  # 第5个字段是星期几 (0-7)
-    
-    # 如果包含英文简写，不做转换
-    if re.search(r'[a-zA-Z]', dow_field):
-        return cron_exp
-    
-    # 处理复杂表达式 (例如: 1-5,0 或 */2)
-    new_dow = []
-    for item in dow_field.split(','):
-        if '/' in item:  # 处理 */2 这样的格式
-            interval_parts = item.split('/')
-            if interval_parts[0] == '*':
-                new_dow.append(item)  # 保持不变
-            else:
-                # 这里可能需要更复杂的处理，暂时保持不变
-                new_dow.append(item)
-        elif '-' in item:  # 处理 1-5 这样的范围
-            range_parts = item.split('-')
-            start = int(range_parts[0])
-            end = int(range_parts[1])
-            # 转换范围边界
-            if start == 0 or start == 7:  # 0和7都表示周日
-                start = 6  # APScheduler中6表示周日
-            else:
-                start = start - 1  # 其他天减1
-                
-            if end == 0 or end == 7:  # 0和7都表示周日
-                end = 6  # APScheduler中6表示周日
-            else:
-                end = end - 1  # 其他天减1
-                
-            new_dow.append(f"{start}-{end}")
-        else:  # 处理单个数字
-            try:
-                day = int(item)
-                if day == 0 or day == 7:  # 0和7都表示周日
-                    new_dow.append('6')  # APScheduler中6表示周日
-                else:
-                    new_dow.append(str(day - 1))  # 其他天减1
-            except ValueError:
-                new_dow.append(item)  # 非数字，保持不变
-    
-    # 替换原表达式中的星期几字段
-    parts[4] = ','.join(new_dow)
-    return ' '.join(parts)
+    storage = BaiduStorage(config_path=args.config, create_if_missing=False)
+    scheduler = TaskScheduler(storage)
+    if args.action == "run-all":
+        results = scheduler.execute_tasks(flush_notifications=True)
+        return 1 if any(not item.get("success") for item in results) else 0
 
-def main():
-    """命令行入口"""
-    import argparse
-    import time
-    
-    parser = argparse.ArgumentParser(description='定时任务管理工具')
-    parser.add_argument('action', choices=['start', 'stop', 'update-task', 'update-default'],
-                       help='要执行的操作')
-    parser.add_argument('--cron', help='新的cron表达式')
-    parser.add_argument('--url', help='要更新的任务URL')
-    
-    args = parser.parse_args()
-    scheduler = TaskScheduler()
-    
-    if args.action == 'start':
-        scheduler.start()
-        try:
-            # 保持程序运行
-            while True:
-                time.sleep(1)
-        except KeyboardInterrupt:
-            scheduler.stop()
-    elif args.action == 'stop':
+    scheduler.start()
+    try:
+        while True:
+            time.sleep(1)
+    except KeyboardInterrupt:
         scheduler.stop()
-    elif args.action == 'update-task':
-        if not args.url or not args.cron:
-            logger.error("更新任务需要提供任务URL和新的cron表达式")
-            return
-        scheduler.update_task(args.url, args.cron)
-    elif args.action == 'update-default':
-        if not args.cron:
-            logger.error("更新默认调度需要提供新的cron表达式")
-            return
-        scheduler.update_default_schedule(args.cron)
+    return 0
 
-if __name__ == '__main__':
-    main() 
+
+if __name__ == "__main__":
+    raise SystemExit(main())

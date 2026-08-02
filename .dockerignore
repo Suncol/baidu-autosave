@@ -1,0 +1,12 @@
+.git
+.venv
+__pycache__
+*.pyc
+.pytest_cache
+frontend
+.playwright-mcp
+.serena
+.spec-workflow
+log
+config/config.json
+*.md

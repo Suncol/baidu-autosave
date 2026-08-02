@@ -1,14 +1,11 @@
-version: '3'
-
 services:
   baidu-autosave:
     image: kokojacket/baidu-autosave:latest
     container_name: baidu-autosave
     restart: unless-stopped
-    ports:
-      - "5000:5000"
     volumes:
       - ./config:/app/config
       - ./log:/app/log
+      - ./state:/app/state
     environment:
-      - TZ=Asia/Shanghai 
+      TZ: Asia/Shanghai

@@ -9,10 +9,13 @@ __pycache__/
 # 配置文件
 /config/config.json
 config/config*.json
+config/*.backup.*
+config/.*.tmp
 git-config
 
 # 日志文件
 log/
+state/
 *.log
 
 # 系统文件
@@ -26,8 +29,8 @@ Thumbs.db
 *.swp
 *.swo
 
-# 测试文件
-test_*.py
+# 测试运行缓存
+.pytest_cache/
 
 # 参考文件
 *参考*.py

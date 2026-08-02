@@ -5,16 +5,61 @@ import json
 import os
 import time
 import re
-from notify import send as notify_send
 import posixpath
 from threading import Lock
-import traceback
+from threading import RLock
 import subprocess
 import shutil
-import json
 import random
+import stat
 import uuid
 from functools import wraps
+from pathlib import Path
+from urllib.parse import parse_qs, urlparse
+
+from config_loader import ConfigError, load_config, validate_config
+
+
+_SHARE_KEY_RE = re.compile(r"^[A-Za-z0-9_-]+$")
+
+
+def _normalize_share_reference(url, password=None):
+    """Return a canonical /s/ URL and an unambiguous extraction password."""
+    if not isinstance(url, str) or not url.strip():
+        raise ValueError("分享链接不能为空")
+    if password is not None and not isinstance(password, str):
+        raise ValueError("提取码必须是字符串或 null")
+
+    parsed = urlparse(url.strip().split("#", 1)[0])
+    if parsed.scheme not in {"http", "https"} or parsed.netloc.lower() != "pan.baidu.com":
+        raise ValueError("无效的百度网盘分享链接格式")
+
+    query = parse_qs(parsed.query, keep_blank_values=True)
+    if any(len(values) != 1 for values in query.values()):
+        raise ValueError("分享链接包含重复的查询参数")
+    if parsed.path == "/share/init":
+        if set(query) - {"surl", "pwd"}:
+            raise ValueError("分享链接包含不受支持的查询参数")
+        share_key = query.get("surl", [""])[0]
+        canonical_url = f"https://pan.baidu.com/s/{share_key}"
+    elif parsed.path.startswith("/s/"):
+        if set(query) - {"pwd"}:
+            raise ValueError("分享链接包含不受支持的查询参数")
+        share_key = parsed.path[len("/s/") :]
+        canonical_url = f"{parsed.scheme}://pan.baidu.com/s/{share_key}"
+    else:
+        raise ValueError("无效的百度网盘分享链接格式")
+
+    if not _SHARE_KEY_RE.fullmatch(share_key):
+        raise ValueError("无效的百度网盘分享链接格式")
+
+    query_password = query.get("pwd", [""])[0]
+    if query_password and not re.fullmatch(r"[A-Za-z0-9]+", query_password):
+        raise ValueError("分享链接中的提取码格式无效")
+    if password and query_password and password != query_password:
+        raise ValueError("参数 pwd 与分享链接中的提取码不一致")
+    return canonical_url, password or query_password or None
+
 
 def _format_transfer_error(error_str):
     """格式化转存错误信息，将百度API返回的模糊错误信息转换为更清晰的提示"""
@@ -70,13 +115,22 @@ def api_retry(max_retries=1, delay_range=(2, 3), exclude_errors=None):
     return decorator
 
 class BaiduStorage:
-    def __init__(self):
+    def __init__(
+        self,
+        config_path="config/config.json",
+        initialize_client=True,
+        create_if_missing=True,
+    ):
+        self.config_path = Path(config_path).expanduser().resolve()
+        self._create_if_missing = create_if_missing
+        self._config_lock = RLock()
         self._client_lock = Lock()  # 添加客户端初始化锁
         self.config = self._load_config()
         if self._ensure_task_uids():
             self._save_config(update_scheduler=False)
         self.client = None
-        self._init_client()
+        if initialize_client:
+            self._init_client()
         self.last_request_time = 0
         self.min_request_interval = 2
         # 添加错误跟踪
@@ -90,51 +144,13 @@ class BaiduStorage:
     def _load_config(self):
         try:
             # 检查配置文件是否存在且不为空
-            if not os.path.exists('config/config.json') or os.path.getsize('config/config.json') == 0:
+            if not self.config_path.exists() or self.config_path.stat().st_size == 0:
+                if not self._create_if_missing:
+                    raise ConfigError(f"配置文件不存在或为空: {self.config_path}")
                 logger.warning("配置文件不存在或为空，将从模板创建")
                 self._create_config_from_template()
-            
-            with open('config/config.json', 'r', encoding='utf-8') as f:
-                config = json.load(f)
-                # 确保配置文件结构完整
-                if 'baidu' not in config:
-                    config['baidu'] = {}
-                if 'users' not in config['baidu']:
-                    config['baidu']['users'] = {}
-                if 'current_user' not in config['baidu']:
-                    config['baidu']['current_user'] = None
-                if 'tasks' not in config['baidu']:
-                    config['baidu']['tasks'] = []
-                if 'cron' not in config:
-                    config['cron'] = {
-                        'default_schedule': '*/5 * * * *',
-                        'auto_install': True
-                    }
-                # 添加 auth 配置结构
-                if 'auth' not in config:
-                    config['auth'] = {
-                        'users': 'admin',
-                        'password': 'admin123',
-                        'session_timeout': 3600
-                    }
-                return config
-        except FileNotFoundError:
-            return {
-                'baidu': {
-                    'users': {},
-                    'current_user': None,
-                    'tasks': []
-                },
-                'cron': {
-                    'default_schedule': '*/5 * * * *',
-                    'auto_install': True
-                },
-                'auth': {
-                    'users': 'admin',
-                    'password': 'admin123',
-                    'session_timeout': 3600
-                }
-            }
+
+            return load_config(self.config_path)
         except Exception as e:
             logger.error(f"加载配置文件失败: {str(e)}")
             raise
@@ -143,14 +159,16 @@ class BaiduStorage:
         """从模板创建配置文件"""
         try:
             # 查找模板文件
+            project_dir = Path(__file__).resolve().parent
             template_paths = [
-                'config/config.template.json',
-                'template/config.template.json'
+                self.config_path.parent / "config.template.json",
+                project_dir / "config" / "config.template.json",
+                project_dir / "template" / "config.template.json",
             ]
             
             template_path = None
             for path in template_paths:
-                if os.path.exists(path):
+                if path.is_file():
                     template_path = path
                     break
             
@@ -159,14 +177,16 @@ class BaiduStorage:
                 raise FileNotFoundError("配置模板文件不存在")
             
             # 备份现有配置文件（如果存在）
-            if os.path.exists('config/config.json'):
-                backup_path = f'config/config.json.backup.{int(time.time())}'
-                shutil.copy2('config/config.json', backup_path)
+            if self.config_path.exists():
+                backup_path = self.config_path.with_name(
+                    f"{self.config_path.name}.backup.{int(time.time())}.{uuid.uuid4().hex}"
+                )
+                shutil.copy2(self.config_path, backup_path)
                 logger.info(f"已备份现有配置文件到: {backup_path}")
             
             # 从模板复制配置文件
-            os.makedirs('config', exist_ok=True)
-            shutil.copy2(template_path, 'config/config.json')
+            self.config_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(template_path, self.config_path)
             logger.info(f"已从模板 {template_path} 创建配置文件")
             
         except Exception as e:
@@ -176,22 +196,40 @@ class BaiduStorage:
     def _save_config(self, update_scheduler=True):
         """保存配置到文件"""
         try:
-            # 在保存前清理 None 值的 cron 字段
-            for task in self.config.get('baidu', {}).get('tasks', []):
-                if 'cron' in task and task['cron'] is None:
-                    del task['cron']
-                    
-            with open('config/config.json', 'w', encoding='utf-8') as f:
-                json.dump(self.config, f, ensure_ascii=False, indent=4)
-            
-            logger.debug("配置保存成功")
-            
-            # 确保配置已经写入文件
-            with open('config/config.json', 'r', encoding='utf-8') as f:
-                saved_config = json.load(f)
-                if saved_config != self.config:
-                    logger.error("配置保存验证失败")
-                    raise Exception("配置保存验证失败")
+            with self._config_lock:
+                # 在保存前清理 None 值的 cron 字段，保留原有配置约定。
+                for task in self.config.get('baidu', {}).get('tasks', []):
+                    if 'cron' in task and task['cron'] is None:
+                        del task['cron']
+
+                validate_config(self.config)
+                self.config_path.parent.mkdir(parents=True, exist_ok=True)
+                existing_mode = (
+                    stat.S_IMODE(self.config_path.stat().st_mode)
+                    if self.config_path.exists()
+                    else None
+                )
+                temp_path = self.config_path.with_name(
+                    f".{self.config_path.name}.{uuid.uuid4().hex}.tmp"
+                )
+                try:
+                    with temp_path.open('w', encoding='utf-8') as f:
+                        json.dump(self.config, f, ensure_ascii=False, indent=4)
+                        f.flush()
+                        os.fsync(f.fileno())
+
+                    saved_config = load_config(temp_path)
+                    if saved_config != self.config:
+                        logger.error("配置保存验证失败")
+                        raise RuntimeError("配置保存验证失败")
+                    if existing_mode is not None:
+                        os.chmod(temp_path, existing_mode)
+                    os.replace(temp_path, self.config_path)
+                finally:
+                    if temp_path.exists():
+                        temp_path.unlink()
+
+                logger.debug("配置保存成功: {}", self.config_path)
             
             # 通知调度器更新任务
             if update_scheduler:
@@ -202,6 +240,26 @@ class BaiduStorage:
         except Exception as e:
             logger.error(f"保存配置失败: {str(e)}")
             raise
+
+    def reload_config(
+        self,
+        initialize_client=True,
+        config=None,
+        persist_generated_uids=True,
+    ):
+        """Reload and validate the configured file without accepting partial data."""
+        new_config = load_config(self.config_path) if config is None else config
+        validate_config(new_config)
+        with self._config_lock:
+            self.config = new_config
+            generated_uids = self._ensure_task_uids()
+            if generated_uids and persist_generated_uids:
+                self._save_config(update_scheduler=False)
+        self._clear_user_info_cache()
+        self.client = None
+        if initialize_client:
+            self._init_client()
+        return self.config
             
     def _init_client(self):
         """初始化客户端"""
@@ -581,10 +639,10 @@ class BaiduStorage:
             order = order if order is not None else task_ref.get('order')
             url = url or task_ref.get('url')
         elif isinstance(task_ref, str):
-            if len(task_ref) == 32 and all(ch in '0123456789abcdef' for ch in task_ref.lower()):
-                task_uid = task_uid or task_ref
-            else:
-                url = url or task_ref
+            # 先按精确 UID 查找，再按 URL 查找。UID 可由用户配置，不应依赖
+            # “32 位十六进制”这一实现细节；URL 仍会在 UID 未命中后兼容解析。
+            task_uid = task_uid or task_ref
+            url = url or task_ref
         elif isinstance(task_ref, int):
             order = order if order is not None else task_ref
 
@@ -675,27 +733,8 @@ class BaiduStorage:
         try:
             if not url or not save_dir:
                 raise ValueError("分享链接和保存目录不能为空")
-            
-            # 移除URL中的hash部分
-            url = url.split('#')[0]
-            
-            # 处理第二种格式: https://pan.baidu.com/share/init?surl=xxx&pwd=xxx
-            # 注意：这里不处理pwd参数，因为pwd由调用方传入
-            if '/share/init?' in url and 'surl=' in url:
-                import urllib.parse
-                parsed = urllib.parse.urlparse(url)
-                params = urllib.parse.parse_qs(parsed.query)
-                
-                # 提取surl参数
-                surl = params.get('surl', [''])[0]
-                
-                # 转换为第一种格式
-                if surl:
-                    url = f"https://pan.baidu.com/s/{surl}"
-            
-            # 验证URL格式（更新正则表达式以适应可能的查询参数）
-            if not re.match(r'^https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+(?:\?pwd=[a-zA-Z0-9]+)?$', url):
-                raise ValueError("无效的百度网盘分享链接格式")
+
+            url, pwd = _normalize_share_reference(url, pwd)
             
             # 获取新任务的顺序值
             new_order = self.get_max_order() + 1
@@ -734,7 +773,12 @@ class BaiduStorage:
             if hasattr(TaskScheduler, 'instance') and TaskScheduler.instance:
                 TaskScheduler.instance.add_single_task(new_task)
             
-            logger.success(f"添加任务成功: {new_task}")
+            logger.success(
+                "添加任务成功: name={} order={} task_uid={}",
+                new_task.get('name'),
+                new_task.get('order'),
+                new_task.get('task_uid'),
+            )
             return True
             
         except Exception as e:
@@ -857,6 +901,11 @@ class BaiduStorage:
             return bool(item.get('isdir', 0) == 0 and not item.get('is_dir', False))
         return bool(getattr(item, 'is_file', False) or not self._is_list_entry_dir(item))
 
+    @api_retry(
+        max_retries=2,
+        delay_range=(1, 2),
+        exclude_errors=[-6, 115, 145, 200025, -9, 31066],
+    )
     def _list_dir_entries_via_pan_api(self, path, client=None):
         """使用 pan API 枚举目录内容，规避 PCS list 对部分路径返回 31023 的问题。"""
         if client is None:
@@ -1185,14 +1234,13 @@ class BaiduStorage:
                 return True, file_path
                 
             except re.error as e:
-                logger.warning(f"正则表达式错误: {pattern}, 错误: {str(e)}")
-                # 正则错误时不过滤，返回原文件
-                return True, file_path
+                # 正则规则决定文件集合和目标文件名。静默忽略会改变转存语义，
+                # 因此必须让本次订阅失败并由调用方记录明确错误。
+                raise ValueError(f"无效的正则表达式 {pattern!r}: {e}") from e
             
         except Exception as e:
             logger.error(f"应用正则规则时出错: {str(e)}")
-            # 出错时返回原始路径，不影响正常流程
-            return True, file_path
+            raise
 
     def transfer_share(self, share_url, pwd=None, new_files=None, save_dir=None, progress_callback=None, task_config=None):
         """转存分享文件
@@ -1243,9 +1291,9 @@ class BaiduStorage:
             try:
                 # 访问分享链接
                 if pwd:
-                    logger.info(f"使用密码 {pwd} 访问分享链接")
-                if progress_callback:
-                        progress_callback('info', f'使用密码访问分享链接')
+                    logger.info("使用配置的提取码访问分享链接（提取码已隐藏）")
+                    if progress_callback:
+                        progress_callback('info', '使用配置的提取码访问分享链接')
                 self._access_shared_with_retry(share_url, pwd, client=temp_client)
 
                 # 步骤1.1：获取分享文件列表并记录
@@ -1783,7 +1831,7 @@ class BaiduStorage:
             time.sleep(wait_time)
         self.last_request_time = time.time()
 
-    @api_retry(max_retries=1, delay_range=(2, 3))
+    @api_retry(max_retries=3, delay_range=(5, 10))
     def _transfer_shared_paths_with_retry(self, remotedir, fs_ids, uk, share_id, bdstoken, shared_url, client=None):
         """带重试功能的转存方法"""
         if client is None:
@@ -1802,7 +1850,10 @@ class BaiduStorage:
         """带重试功能的访问分享链接方法"""
         if client is None:
             client = self.client
-        return client.access_shared(share_url, pwd)
+        # baidupcs-py defaults to opening a GUI captcha image and prompting on
+        # stdin. A config-driven daemon must never block on hidden interaction;
+        # show_vcode=False makes the exact API error propagate to this run's log.
+        return client.access_shared(share_url, pwd, show_vcode=False)
 
     @api_retry(max_retries=1, delay_range=(2, 3))
     def _shared_paths_with_retry(self, shared_url, client=None):
@@ -1823,7 +1874,7 @@ class BaiduStorage:
         try:
             logger.info(f"开始获取分享链接 {share_url} 的文件列表")
             if pwd:
-                logger.info(f"使用密码 {pwd} 访问分享链接")
+                logger.info("使用配置的提取码访问分享链接（提取码已隐藏）")
                 
             logger.debug("开始访问分享链接...")
             self._access_shared_with_retry(share_url, pwd)
@@ -1854,6 +1905,7 @@ class BaiduStorage:
                             all_files.extend(sub_files)
                         except Exception as e:
                             logger.error(f"获取文件夹 {file.path} 内容失败: {str(e)}")
+                            raise
                     else:
                         all_files.append(file)
                         
@@ -1894,15 +1946,17 @@ class BaiduStorage:
                     if error:
                         task['error'] = error
                         task['status'] = 'error'  # 如果有错误信息，强制设置为错误状态
-                    elif status == 'error' and message:
+                    elif status in ['error', 'failed'] and message:
                         task['error'] = message
+                    elif task['status'] == 'normal':
+                        task.pop('error', None)
                     if transferred_files:
                         task['transferred_files'] = transferred_files
                     
                     # 添加最后执行时间
                     task['last_execute_time'] = int(time.time())
                     
-                    self._save_config()
+                    self._save_config(update_scheduler=False)
                     logger.info(f"已更新任务状态: {task_url} -> {task['status']} ({message})")
                     return True
             return False
@@ -1948,7 +2002,7 @@ class BaiduStorage:
             files = []
 
             def _list_dir_with_fallback(path, allow_missing=False):
-                """优先使用 PCS list，失败时回退到 pan API。"""
+                """使用 pan API 枚举；非缺失类失败时显式回退到 PCS list。"""
                 try:
                     return self._list_dir_entries_with_fallback(path, client=client)
                 except Exception as list_error:
@@ -1956,9 +2010,6 @@ class BaiduStorage:
                         if allow_missing:
                             return None
                         raise
-
-                    if allow_missing and not self._confirm_dir_exists(path, client=client, check_error=list_error):
-                        return None
 
                     raise
 
@@ -1970,7 +2021,7 @@ class BaiduStorage:
                     return []
             except Exception as e:
                 logger.error(f"检查目录 {dir_path} 时出错: {str(e)}")
-                return []
+                raise
 
             def _list_dir(path, prefetched_content=None):
                 try:
@@ -2007,8 +2058,10 @@ class BaiduStorage:
             return files
 
         except Exception as e:
+            # 无法确认目录内容时返回空列表会把“扫描失败”误判为“目录为空”，
+            # 从而造成重复转存。向上传播错误以终止本次任务。
             logger.error(f"获取本地文件列表失败: {str(e)}")
-            return []
+            raise
             
     def _extract_file_info(self, file_dict):
         """从文件字典中提取文件信息
@@ -2073,8 +2126,7 @@ class BaiduStorage:
                 elif isinstance(sub_paths, dict):
                     sub_files = sub_paths.get('list', [])
                 else:
-                    logger.error(f"子目录内容格式错误: {type(sub_paths)}")
-                    break
+                    raise TypeError(f"子目录内容格式错误: {type(sub_paths)}")
                 
                 if not sub_files:
                     # 没有更多文件了
@@ -2116,7 +2168,8 @@ class BaiduStorage:
                 
         except Exception as e:
             logger.error(f"获取目录 {path.path} 内容失败: {str(e)}")
-            
+            raise
+
         return files
 
     def update_user(self, username, cookies):
@@ -2211,19 +2264,24 @@ class BaiduStorage:
             if not url:
                 raise ValueError("分享链接不能为空")
             
-            # 移除hash部分
-            url = url.split('#')[0]
-            
-            # 验证URL格式
-            if not re.match(r'^https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+(\?pwd=[a-zA-Z0-9]+)?$', url):
-                raise ValueError("无效的百度网盘分享链接格式")
+            pwd_supplied = task_data.get('pwd') is not None
+            url, normalized_pwd = _normalize_share_reference(
+                url,
+                task_data.get('pwd') if pwd_supplied else None,
+            )
+            if normalized_pwd is not None:
+                requested_pwd = normalized_pwd
+            elif pwd_supplied:
+                requested_pwd = task_data.get('pwd')
+            else:
+                requested_pwd = old_task.get('pwd')
             
             # 更新任务信息
             tasks[index].update({
                 'name': task_data.get('name', '').strip() or old_task.get('name', ''),
                 'url': url,
                 'save_dir': task_data.get('save_dir', '').strip() or old_task.get('save_dir', ''),
-                'pwd': task_data.get('pwd') if task_data.get('pwd') is not None else old_task.get('pwd'),
+                'pwd': requested_pwd,
                 'status': 'pending',  # 重置任务状态
                 'last_update': int(time.time())  # 添加更新时间戳
             })
@@ -2254,7 +2312,12 @@ class BaiduStorage:
                 TaskScheduler.instance.update_task_schedule(tasks[index], tasks[index].get('cron'))
                 logger.info(f"已更新任务调度: {tasks[index].get('task_uid', url)}")
             
-            logger.success(f"更新任务成功: {tasks[index]}")
+            logger.success(
+                "更新任务成功: name={} order={} task_uid={}",
+                tasks[index].get('name'),
+                tasks[index].get('order'),
+                tasks[index].get('task_uid'),
+            )
             return True, True  # 第二个True表示调度器已更新
             
         except Exception as e:
@@ -2357,15 +2420,17 @@ class BaiduStorage:
                     if error:
                         task['error'] = error
                         task['status'] = 'error'  # 如果有错误信息，强制设置为错误状态
-                    elif status == 'error' and message:
+                    elif status in ['error', 'failed'] and message:
                         task['error'] = message
+                    elif task['status'] == 'normal':
+                        task.pop('error', None)
                     if transferred_files:
                         task['transferred_files'] = transferred_files
                     
                     # 添加最后执行时间
                     task['last_execute_time'] = int(time.time())
                     
-                    self._save_config()
+                    self._save_config(update_scheduler=False)
                     logger.info(f"已更新任务状态: order={order} -> {task['status']} ({message})")
                     return True
             return False
@@ -2424,19 +2489,24 @@ class BaiduStorage:
             if not url:
                 raise ValueError("分享链接不能为空")
             
-            # 移除hash部分
-            url = url.split('#')[0]
-            
-            # 验证URL格式
-            if not re.match(r'^https?://pan\.baidu\.com/s/[a-zA-Z0-9_-]+(\?pwd=[a-zA-Z0-9]+)?$', url):
-                raise ValueError("无效的百度网盘分享链接格式")
+            pwd_supplied = task_data.get('pwd') is not None
+            url, normalized_pwd = _normalize_share_reference(
+                url,
+                task_data.get('pwd') if pwd_supplied else None,
+            )
+            if normalized_pwd is not None:
+                requested_pwd = normalized_pwd
+            elif pwd_supplied:
+                requested_pwd = task_data.get('pwd')
+            else:
+                requested_pwd = old_task.get('pwd')
             
             # 更新任务信息
             tasks[task_index].update({
                 'name': task_data.get('name', '').strip() or old_task.get('name', ''),
                 'url': url,
                 'save_dir': task_data.get('save_dir', '').strip() or old_task.get('save_dir', ''),
-                'pwd': task_data.get('pwd') if task_data.get('pwd') is not None else old_task.get('pwd'),
+                'pwd': requested_pwd,
                 'status': task_data.get('status', old_task.get('status', 'normal')),  # 保持原有状态
                 'message': task_data.get('message', old_task.get('message', '')),  # 保持原有消息
                 'last_update': int(time.time())  # 添加更新时间戳
@@ -2481,7 +2551,12 @@ class BaiduStorage:
                 TaskScheduler.instance.update_task_schedule(tasks[task_index], tasks[task_index].get('cron'))
                 logger.info(f"已更新任务调度: {tasks[task_index].get('task_uid', url)}")
             
-            logger.success(f"更新任务成功: {tasks[task_index]}")
+            logger.success(
+                "更新任务成功: name={} order={} task_uid={}",
+                tasks[task_index].get('name'),
+                tasks[task_index].get('order'),
+                tasks[task_index].get('task_uid'),
+            )
             return True
             
         except Exception as e:

@@ -1,431 +1,288 @@
 # 百度网盘自动转存
 
-> **声明**：本项目是使用 Cursor AI 辅助编写的。本人是一名剪辑师，非专业程序员，精力有限。如遇到使用问题，请先查阅文档并尝试自行解决，谢谢理解。
+这是一个纯后端、配置文件驱动的百度网盘订阅转存工具。2.0 版移除了 Flask、HTTP API、SSE、Vue 前端和登录页面；用户、订阅、定时、通知等声明全部来自 JSON 配置，运行和运维操作通过 `cli.py` 完成。
 
-一个基于Flask的百度网盘自动转存系统，支持多用户管理、定时任务调度和通知推送。
+## 核心能力
 
-## 主要特性
+- 自动扫描分享内容并转存新增文件，保留原有目录处理和去重逻辑
+- 多百度账号配置，通过 `baidu.current_user` 选择本次运行账号
+- 每个订阅独立 cron，或使用一个/多个全局默认 cron
+- 正则文件过滤与重命名；无效正则会终止该订阅，不会静默改为全量转存
+- 多种通知渠道和自定义 Webhook，支持短时间结果合并
+- 网盘容量检查与阈值告警
+- 为网盘目录生成分享链接
+- `tqdm` 展示准确的订阅完成进度和当前阶段
+- 每次订阅运行保存独立、完整的 DEBUG 日志
+- 声明式配置、运行状态和日志相互隔离；配置与状态使用原子替换写入
 
-- 🔄 自动转存：支持自动转存百度网盘分享链接到指定目录
-- 👥 多用户管理：支持添加多个百度网盘账号
-- ⏰ 定时任务：支持全局定时和单任务定时规则
-- 📱 消息推送：支持25+种通知方式和自定义WEBHOOK
-- 🎯 任务分类：支持对任务进行分类管理
-- 📊 状态监控：实时显示任务执行状态和进度
-- 🔍 智能去重：自动跳过已转存的文件
-- 💾 容量监控：监控网盘容量并在超过阈值时发送通知
-- 📋 链接复制：支持一键复制分享链接到剪贴板
-- 🤖 智能填充：自动获取分享链接的文件夹名称并填充任务名称
-- 🔍 正则处理：支持文件过滤和重命名的正则表达式功能
-- 🎨 美观界面：响应式设计，支持移动端访问
+转存与去重的核心实现仍位于 `storage.py`，没有替换为近似算法。无法确认目标目录内容时任务会失败，而不是把扫描失败当成空目录后重复转存。
 
-## 系统要求
+所有运行路径均为非交互式。百度接口若要求图形验证码，程序不会打开 GUI 或等待输入，而会让该订阅明确失败并保留完整日志；本项目没有实现验证码绕过或近似替代。
 
-- Python 3.10（baidupcs-py-0.7.6只支持3.10）
-- Windows/Linux/MacOS
+## 环境要求与安装
 
-## 通信模式
+- Python 3.10
+- Windows、Linux 或 macOS
 
-项目支持两种前后端通信模式：
-
-1. **轮询模式（默认）**：前端定期向后端发送请求获取最新状态，适用于所有环境，不需要额外的依赖。
-2. **WebSocket模式**：使用WebSocket实时通信，需要安装`gevent-websocket`依赖。
-
-默认情况下，项目使用轮询模式。如果需要启用WebSocket模式，请确保：
-1. 在`requirements.txt`中取消对`gevent-websocket`的注释
-2. 在`static/main.js`中将`WS_CONFIG.enabled`设置为`true`
-
-## 安装说明
-
-1. 克隆仓库：
 ```bash
-git clone https://github.com/your-username/baidu-autosave.git
-cd baidu-autosave
-```
-
-2. 安装后端依赖：
-```bash
-uv python install 3.10
-uv venv --python 3.10 --python-preference only-managed
+source .venv/bin/activate
 uv pip install -r requirements.txt
 ```
 
-3. 构建前端：
+开发与测试依赖：
+
 ```bash
-cd frontend
-npm ci
-npm run build:prod
-cd ..
+source .venv/bin/activate
+uv pip install -r requirements-dev.txt
 ```
 
-4. 运行应用：
+## 快速开始
+
+创建配置：
+
 ```bash
-.venv/bin/python web_app.py
+source .venv/bin/activate
+python cli.py init
 ```
 
-5. 访问Web界面：
-```
-http://localhost:5000
-```
-
-## Docker 部署
-
-### 使用 docker-compose 部署（推荐）
-
-1. 创建 `docker-compose.yml` 文件：
-```yaml
-version: '3'
-
-services:
-  baidu-autosave:
-    image: kokojacket/baidu-autosave:latest
-    container_name: baidu-autosave
-    restart: unless-stopped
-    ports:
-      - "5000:5000"
-    volumes:
-      - ./config:/app/config
-      - ./log:/app/log
-    environment:
-      - TZ=Asia/Shanghai
-```
-
-2. 创建必要目录：
-```bash
-mkdir -p config log
-```
-
-3. 启动服务：
-```bash
-docker-compose up -d
-```
-
-4. 查看日志：
-```bash
-docker-compose logs -f
-```
-
-5. 访问Web界面：
-```
-http://localhost:5000
-```
-
-> 默认登录账号：admin  
-> 默认登录密码：admin123
-
-### 使用 Docker CLI 部署
-
-1. 创建必要目录：
-```bash
-mkdir -p config log
-```
-
-2. 启动容器：
-```bash
-docker run -d \
-  --name baidu-autosave \
-  --restart unless-stopped \
-  -p 5000:5000 \
-  -v $(pwd)/config:/app/config \
-  -v $(pwd)/log:/app/log \
-  -e TZ=Asia/Shanghai \
-  kokojacket/baidu-autosave:latest
-```
-
-3. 查看日志：
-```bash
-docker logs -f baidu-autosave
-```
-
-4. 访问Web界面：
-```
-http://localhost:5000
-```
-> 默认登录账号：admin  
-> 默认登录密码：admin123
-
-### 目录结构说明
-
-```
-baidu-autosave/
-├── config/                # 配置文件目录
-│   ├── config.json       # 运行时配置文件（自动生成）
-│   └── config.template.json  # 配置文件模板
-├── log/                  # 日志目录
-│   └── web_app_*.log    # 应用日志文件
-├── static/               # 静态资源目录
-│   ├── style.css        # 样式表
-│   ├── main.js          # 主脚本文件
-│   └── favicon/         # 网站图标资源
-├── templates/            # 模板文件目录
-│   ├── index.html       # 主页面模板
-│   └── login.html       # 登录页面模板
-├── docs/                 # 文档目录
-├── Dockerfile           # Docker构建文件
-├── docker-compose.yml   # Docker编排文件
-├── requirements.txt     # 项目依赖
-├── LICENSE              # 许可证文件
-├── web_app.py           # Web应用主程序
-├── storage.py           # 存储管理模块
-├── scheduler.py         # 任务调度模块
-├── utils.py             # 工具函数
-└── notify.py            # 通知模块
-```
-
-### 主要模块说明
-
-- **web_app.py**: Web应用核心，处理HTTP请求和WebSocket通信
-- **storage.py**: 管理百度网盘API调用和数据存储
-- **scheduler.py**: 处理定时任务的调度和执行
-- **notify.py**: 实现各种通知方式
-- **utils.py**: 提供通用工具函数
-
-## 使用说明
-
-### 1. 添加用户
-
-1. 登录百度网盘网页版
-2. 按F12打开开发者工具获取cookies
-3. 在系统中添加用户，填入cookies
-
-### 2. 添加任务
-
-1. 点击"添加任务"按钮
-2. 填写任务信息：
-   - 任务名称（可选，支持自动获取分享链接的文件夹名称）
-   - 分享链接（必填，输入完成后会自动获取文件夹名称）
-   - 保存目录（必填，会根据任务名称智能同步）
-   - 定时规则（可选）
-   - 分类（可选）
-   - 过滤表达式（可选，正则表达式过滤需要转存的文件）
-   - 重命名表达式（可选，正则表达式重命名转存的文件）
-
-**智能功能说明：**
-- **自动填充任务名称**：输入分享链接后，系统会自动获取分享内容的文件夹名称并填充到任务名称
-- **保存目录同步**：任务名称变化时会自动更新保存目录的最后一级文件夹名
-- **编辑检测**：一旦手动编辑保存目录，当前任务将停止自动同步；新建任务时重新启用
-- **分享链接复制**：任务创建后，可在任务列表中一键复制分享链接
-- **正则文件过滤**：使用正则表达式筛选需要转存的文件，如 `^(\d+)\.mp4$` 只转存以数字开头的mp4文件
-- **正则文件重命名**：使用正则表达式重命名转存的文件，如 `第\1集.mp4` 将匹配的数字替换为"第X集"格式
-
-**⚠️ 重命名功能注意事项：**
-百度网盘API对重命名操作有严格的频率限制，频繁重命名可能导致失败或触发风控。建议优先通过调整分享源文件名来满足需求，谨慎使用重命名功能。
-
-### 3. 定时设置
-
-- 全局定时规则：适用于所有未设置自定义定时的任务
-- 单任务定时：可为每个任务设置独立的定时规则
-- 定时规则使用cron表达式，例如：
-  - `*/5 * * * *` : 每5分钟执行一次
-  - `0 */1 * * *` : 每小时执行一次
-  - `0 8,12,18 * * *` : 每天8点、12点、18点执行
-
-### 4. 通知设置
-
-系统支持25+种通知方式，包括但不限于：
-- **PushPlus**: 访问 [pushplus.plus](http://www.pushplus.plus) 获取Token
-- **Bark**: iOS平台推送服务
-- **钉钉机器人**: 企业钉钉群组通知
-- **飞书机器人**: 企业飞书群组通知
-- **企业微信**: 企业微信应用和机器人推送
-- **Telegram**: Telegram机器人推送
-- **SMTP邮件**: 支持各种邮件服务商
-- **自定义WEBHOOK**: 支持任意HTTP接口推送
-- **其他**: Gotify、iGot、ServerJ、PushDeer等
-
-**配置方法：**
-1. 在系统设置的"通知设置"部分启用通知功能
-2. 添加对应通知服务的字段配置（如`PUSH_PLUS_TOKEN`）
-3. 对于WEBHOOK配置，支持快速添加和简化输入格式
-4. 点击"测试通知"验证配置是否正确
-5. 支持同时配置多种通知方式
-
-**WEBHOOK配置说明：**
-- 系统提供"添加WEBHOOK配置"按钮，可一键添加所有必需的WEBHOOK字段
-- WEBHOOK_BODY字段支持简化输入格式：`title: "$title"content: "$content"source: "项目名"`
-- 保存时系统会自动转换为标准多行格式，无需手动处理换行符和转义
-- 支持自定义HTTP方法、请求头和请求体格式
-
-**通知延迟合并功能：**
-1. 当多个任务在短时间内执行完成时，系统会将通知合并为一条发送
-2. 可在系统设置页面的"通知设置"部分设置通知延迟时间（默认30秒）
-3. 延迟时间越长，越有可能将更多任务的通知合并在一起
-4. 这有助于减少频繁的通知推送，提高用户体验
-
-### 5. 网盘容量监控
-
-系统支持自动监控网盘容量并在超过阈值时发送通知：
-1. 在系统设置中启用"网盘容量提醒"
-2. 设置容量提醒阈值（默认90%）
-3. 设置检查时间（默认每天00:00）
-4. 当网盘使用量超过设定阈值时，系统将通过已配置的通知渠道发送警告
-
-## 配置文件说明
-
-`config.json` 包含以下主要配置（示例）：
+编辑 `config/config.json`，至少填写当前用户和订阅。Cookies 必须包含 `BDUSS` 与 `STOKEN`：
 
 ```json
 {
-    "baidu": {
-        "users": {},          // 用户信息
-        "current_user": "",   // 当前用户
-        "tasks": []          // 任务列表
+  "runtime": {
+    "timezone": "Asia/Shanghai",
+    "progress": true,
+    "log_dir": "log",
+    "state_file": "state/task_status.json",
+    "log_level": "INFO",
+    "general_log_retention_days": 14
+  },
+  "baidu": {
+    "users": {
+      "main": {
+        "cookies": "BDUSS=替换为真实值; STOKEN=替换为真实值"
+      }
     },
-    "retry": {
-        "max_attempts": 3,    // 最大重试次数
-        "delay_seconds": 5    // 重试间隔
-    },
-    "cron": {
-        "default_schedule": [   // 默认定时规则，支持多个 cron 表达式
-            "0 10 * * *"
-        ],
-        "auto_install": true    // 自动启动定时
-    },
-    "notify": {
-        "enabled": true,      // 启用通知
-        "notification_delay": 30, // 通知延迟合并时间（秒），设置为0禁用合并
-        "direct_fields": {     // 直接映射到通知库的字段（推荐）
-            "PUSH_PLUS_TOKEN": "",        // PushPlus Token
-            "PUSH_PLUS_USER": "",         // PushPlus 群组编码（可选）
-            "BARK_PUSH": "",              // Bark 推送地址或设备码
-            "DD_BOT_TOKEN": "",           // 钉钉机器人 Token
-            "DD_BOT_SECRET": "",          // 钉钉机器人 Secret
-            "TG_BOT_TOKEN": "",           // Telegram 机器人 Token
-            "TG_USER_ID": "",             // Telegram 用户 ID
-            "SMTP_SERVER": "",            // SMTP 服务器地址
-            "SMTP_EMAIL": "",             // SMTP 发件邮箱
-            "SMTP_PASSWORD": "",          // SMTP 登录密码
-            "WEBHOOK_URL": "",            // 自定义 Webhook 地址
-            "WEBHOOK_METHOD": "POST",     // 自定义 Webhook 请求方法
-            "WEBHOOK_CONTENT_TYPE": "application/json", // 请求内容类型
-            "WEBHOOK_HEADERS": "Content-Type: application/json", // 请求头
-            "WEBHOOK_BODY": "title: \"$title\"\ncontent: \"$content\"\nsource: \"项目名\"" // 请求体格式
-        },
-        "custom_fields": {     // 自定义字段，可通过界面动态添加
-        }
-        // 兼容旧格式：也支持 { "channels": { "pushplus": { "token": "", "topic": "" } } }
-    },
-    "quota_alert": {
-        "enabled": true,      // 是否启用容量提醒
-        "threshold_percent": 90, // 容量提醒阈值百分比
-        "check_schedule": "0 0 * * *" // 检查时间（默认每天00:00）
-    },
-    "scheduler": {
-        "max_workers": 1,     // 最大工作线程数
-        "misfire_grace_time": 3600,  // 错过执行的容错时间
-        "coalesce": true,     // 合并执行错过的任务
-        "max_instances": 1    // 同一任务的最大并发实例数
-    }
+    "current_user": "main",
+    "tasks": [
+      {
+        "order": 1,
+        "name": "示例订阅",
+        "url": "https://pan.baidu.com/s/1AbCdEfGhIj",
+        "pwd": "a1b2",
+        "save_dir": "/自动转存/示例订阅",
+        "regex_pattern": ".*\\.mp4$",
+        "regex_replace": ""
+      }
+    ]
+  },
+  "cron": {
+    "default_schedule": ["0 10 * * *"]
+  },
+  "notify": {
+    "enabled": false,
+    "notification_delay": 30,
+    "direct_fields": {},
+    "custom_fields": {}
+  },
+  "scheduler": {
+    "max_workers": 1,
+    "misfire_grace_time": 3600,
+    "coalesce": true,
+    "max_instances": 1
+  },
+  "quota_alert": {
+    "enabled": true,
+    "threshold_percent": 90,
+    "check_schedule": "0 0 * * *"
+  },
+  "share": {
+    "default_password": "1234",
+    "default_period_days": 7
+  },
+  "file_operations": {
+    "rename_delay_seconds": 0.5
+  }
 }
 ```
 
-## 常见问题
+先做离线校验，再访问百度网盘：
 
-1. **任务执行失败**
-   - 检查分享链接是否有效
-   - 确认账号登录状态
-   - 查看错误日志了解详细原因
+```bash
+python cli.py validate
+python cli.py run
+```
 
-2. **定时任务不执行**
-   - 确认定时规则格式正确
-   - 检查系统时间是否准确
-   - 查看调度器日志
+常驻运行定时任务：
 
-3. **通知推送失败**
-   - 验证通知服务的Token/配置是否正确（如PushPlus Token、Bark设备码等）
-   - 使用"测试通知"功能验证配置
-   - 检查网络连接和防火墙设置
-   - 查看日志了解具体错误信息
+```bash
+python cli.py daemon
+```
 
-4. **WEBHOOK配置问题**
-   - 使用"添加WEBHOOK配置"按钮可自动添加所有必需字段
-   - WEBHOOK_BODY支持简化格式输入，系统会自动转换
-   - 确认目标服务器能正常接收JSON格式的POST请求
-   - 检查WEBHOOK_URL地址是否可访问
-   - 验证WEBHOOK_HEADERS配置是否符合目标服务器要求
+同一进程内的订阅转存严格串行执行；多个定时点同时触发时会排队，不会因抢锁失败而丢弃其中一条订阅。`scheduler.max_workers` 控制调度器工作线程数量，但不会绕过这项转存串行约束。
 
-5. **通知未合并**
-   - 确认通知延迟时间设置合理（默认30秒）
-   - 检查任务执行时间间隔是否超过了设定的延迟时间
-   - 容量警告等重要通知不会被合并，会立即发送
+## 配置语义
 
-6. **正则表达式使用问题**
-   - 确认正则表达式语法正确，可使用在线正则测试工具验证
-   - 过滤表达式用于筛选文件，重命名表达式用于文件重命名
-   - 重命名功能可能因频率限制失败，建议谨慎使用
-   - 示例：过滤 `\.mp4$` 只转存mp4文件，重命名 `(.+)\.mp4$` → `\1_renamed.mp4`
+### 订阅字段
 
-## 开发说明
+每个 `baidu.tasks` 元素使用以下字段：
 
-### 主要模块说明
+| 字段 | 必需 | 含义 |
+|---|---:|---|
+| `order` | 是 | 正整数且全局唯一；也可用于 CLI 选择任务 |
+| `url` | 是 | 不含查询参数的 `http://pan.baidu.com/s/...` 或 `https://pan.baidu.com/s/...` 分享链接；提取码必须单独写入 `pwd` |
+| `save_dir` | 是 | 百度网盘目标目录；没有 `/` 前缀时运行时会补齐 |
+| `name` | 否 | 可读名称；同名任务应用 `task_uid` 或 `order` 选择 |
+| `pwd` | 否 | 分享提取码；日志只记录是否配置，不记录原值 |
+| `task_uid` | 否 | 稳定标识；省略时首次初始化会生成并原子写回配置 |
+| `cron` | 否 | 该订阅专用定时；省略时使用 `cron.default_schedule` |
+| `category` | 否 | 分类元数据，转存逻辑不依赖它 |
+| `regex_pattern` | 否 | 使用 `re.search` 筛选完整分享路径 |
+| `regex_replace` | 否 | 匹配成功后使用 `re.sub` 生成目标文件名 |
 
-- **web_app.py**: Web应用核心，处理HTTP请求和WebSocket通信
-- **storage.py**: 管理百度网盘API调用和数据存储
-- **scheduler.py**: 处理定时任务的调度和执行
-- **notify.py**: 实现各种通知方式
-- **utils.py**: 提供通用工具函数
+`regex_pattern` 不匹配的文件不会转存。匹配且 `regex_replace` 非空时，程序会在转存后重命名；重命名仍沿用原项目的限频延迟和重试逻辑。
 
-## 更新日志
+### cron
 
-### v1.1.3
-- 修复移动端任务卡片样式不一致的问题，统一间距、字体和对齐方式
-- 修复移动端分享链接按钮换行和被截断的布局问题
-- 优化PC端分享链接显示，恢复可点击链接和内联复制按钮功能
-- 移除版本信息获取失败时的错误通知，改为静默处理避免干扰用户
-- 改进响应式设计，确保移动端和桌面端的一致性体验
+配置接受五字段 cron：`分钟 小时 日期 月份 星期`。星期数字按传统 cron 编号转换：`0`/`7` 为周日，`1` 为周一；三字母英文星期与月份缩写也会先展开为明确集合。所有字段都会严格检查边界、范围和步长，然后才交给 APScheduler。
 
-### v1.1.2
-- 修复正则表达式字段二次编辑保存失败的问题
-- 修复定时任务运行时手动执行任务可能出现提取码错误的并发问题
-- 优化分享链接失效时的错误信息显示，将复杂的API错误转换为用户友好的提示
-- 改进错误处理机制，提升用户体验
+传统 cron 与 APScheduler 对“日期和星期同时受限”分别常用 OR 与 AND 语义。为了不静默改变执行日期，本项目明确拒绝这种有歧义的单条表达式；请只限制其中一个字段。
 
-### v1.1.1
-- 新增WEBHOOK配置自动格式化功能，简化用户配置过程
-- 添加"添加WEBHOOK配置"快速按钮，一键添加所有必需的WEBHOOK字段
-- WEBHOOK_BODY字段支持简化输入格式，系统会自动转换为标准多行格式
-- 优化前端WEBHOOK配置体验，移除复杂的格式化逻辑
-- 后端自动处理WEBHOOK_BODY字段的格式转换，确保兼容性
-- 改进通知配置的用户体验，降低配置难度
+示例：
 
-### v1.1.0
-- 新增正则表达式功能，支持文件过滤和重命名处理
-- 添加通知延迟合并功能，解决同一时间多个任务执行时发送多条通知的问题
-- 优化通知发送逻辑，提高用户体验
-- 添加通知延迟时间配置选项到系统设置页面，无需手动修改配置文件
-- 默认延迟时间为30秒，可根据需要调整
-- 添加分享链接一键复制功能，提升使用便利性
-- 优化任务名称与保存目录单向同步逻辑，支持智能编辑检测
-- 增强分享链接自动填充功能，每次输入链接时都会自动更新任务名称
-- 完善通知功能集成，支持25+种通知方式和自定义WEBHOOK
-- 添加重命名频率限制提醒，避免触发百度网盘API风控
+- `*/5 * * * *`：每 5 分钟
+- `0 */2 * * *`：每 2 小时
+- `0 8,12,18 * * *`：每天 08:00、12:00、18:00
+- `0 10 * * 1-5`：周一至周五 10:00
 
-### v1.0.9
-- 添加网盘容量监控功能，支持在容量超过阈值时发送通知
-- 优化前端界面交互体验
-- 修复配置加载和保存的问题
+时区来自 `runtime.timezone`，必须是有效 IANA 时区名称。
 
-### v1.0.2
-- 修复任务编辑时提取码丢失的问题
-- 优化任务更新逻辑，确保密码信息正确保存
-- 改进任务调度更新机制
+### 通知
 
-### v1.0.1
-- 优化界面交互体验
-- 修复已知问题
-- 提升系统稳定性
+只有 `notify.enabled=true` 时才会入队和发送通知。`notification_delay=0` 表示立即发送；正数表示在最后一个结果到达后延迟指定秒数并合并。`direct_fields` 与 `custom_fields` 的字段名对应 `notify.py` 中的通知变量，例如：
 
-### v1.0.0
-- 初始版本发布
-- 实现基本功能：任务管理、定时执行、通知推送
+```json
+{
+  "enabled": true,
+  "notification_delay": 30,
+  "direct_fields": {
+    "PUSH_PLUS_TOKEN": "token",
+    "PUSH_PLUS_USER": "",
+    "WEBHOOK_URL": "https://example.invalid/hook",
+    "WEBHOOK_METHOD": "POST",
+    "WEBHOOK_CONTENT_TYPE": "application/json",
+    "WEBHOOK_HEADERS": "Content-Type: application/json",
+    "WEBHOOK_BODY": "title: $title\ncontent: $content"
+  }
+}
+```
 
-## 许可证
+通知渠道自身的 HTTP 返回与错误处理仍由 `notify.py` 负责。`notify-test` 表示通知函数调用完成，不等同于第三方服务最终送达保证，应同时检查接收端。
 
-MIT License
+## CLI
 
-## 致谢
+全局参数必须写在子命令之前，例如：
 
-- [Flask](https://flask.palletsprojects.com/)
-- [APScheduler](https://apscheduler.readthedocs.io/)
-- [baidupcs-py](https://github.com/PeterDing/BaiduPCS-Py)
-- [quark-auto-save](https://github.com/Cp0204/quark-auto-save) - 夸克网盘自动转存项目，提供了很好的参考
+```bash
+python cli.py --config /path/config.json --log-dir /path/log run --task 1
+```
+
+常用命令：
+
+```bash
+# 不联网校验配置
+python cli.py validate
+
+# 查看用户、订阅、定时和最近运行状态（不打印 Cookies）
+python cli.py list
+
+# 执行全部订阅
+python cli.py run
+
+# 按 order、task_uid、唯一名称或 URL 执行；--task 可重复
+python cli.py run --task 1 --task another-task-uid
+
+# 常驻调度
+python cli.py daemon
+
+# 容量检查；达到阈值且通知启用时发送告警
+python cli.py quota
+
+# 测试通知
+python cli.py notify-test
+
+# 获取分享内容顶层名称，辅助填写配置
+python cli.py inspect-share 'https://pan.baidu.com/s/1AbCdEfGhIj' --password a1b2
+
+# 分享任意网盘路径或某个订阅的保存目录
+python cli.py share --path /自动转存/示例订阅
+python cli.py share --task 1 --password 1234 --period-days 7
+```
+
+`run` 的退出码：全部成功或跳过为 `0`，存在转存失败为 `1`，配置/选择器错误为 `2`，用户中断为 `130`。
+
+修改常驻进程的配置后，在 Linux/macOS 向进程发送 `SIGHUP` 触发严格校验和安全重载；无效配置会被拒绝，旧调度继续运行。Windows 或不便发送信号的容器环境请重启进程。
+
+## 进度、状态与日志
+
+`tqdm` 的 `0/1` 表示一个订阅是否完成，后缀显示当前转存阶段。百度接口按目录批量转存，底层没有可靠的逐文件完成事件，因此程序不会伪造文件百分比。可用 `--no-progress` 或 `runtime.progress=false` 关闭。
+
+文件布局：
+
+```text
+log/
+├── application_2026-08-01.log
+└── subscriptions/
+    └── <task_uid>/
+        └── 20260801T120000+0800_<run_id>.log
+state/
+└── task_status.json
+```
+
+- 应用日志始终记录 DEBUG 到文件，控制台级别由 `runtime.log_level` 控制。
+- 通用应用日志默认保留 14 天；设 `general_log_retention_days=0` 表示不自动清理。
+- 订阅日志每次运行一个文件，不自动删除，包含从任务开始、底层扫描/API 操作、回调进度到最终结果的完整记录。
+- `state/task_status.json` 只保存最近状态、时间、本次运行文件列表和最近日志路径；新一轮开始时会清除上一轮的文件列表。
+- `config/config.json` 不再承载运行状态，任务执行不会覆盖用户正在编辑的声明式配置。
+- 日志过滤常见 Cookie 键，提取码不写入日志；配置文件本身仍包含敏感凭据，请限制文件权限并避免提交到 Git。
+
+## Docker Compose
+
+```bash
+mkdir -p config log state
+cp config/config.template.json config/config.json
+# 编辑 config/config.json
+docker compose up -d
+docker compose logs -f
+```
+
+容器没有 HTTP 端口。卷分别保存配置、日志和运行状态。如果挂载目录中没有 `config.json`，入口脚本会创建模板；填写后重启容器。
+
+## 从 Web 版本迁移
+
+原有 `config/config.json` 中的用户、任务、定时表达式、通知、调度器、容量告警、分享和重命名延迟配置可继续使用。迁移步骤：
+
+1. 备份现有 `config/config.json` 与 `log/`。
+2. 将模板新增的 `runtime` 段加入配置。删除旧 `auth`、顶层 `retry`、顶层 `regex`、`cron.auto_install`、`file_operations.batch_size` 和 `file_operations.concurrent_limit`。`auth` 与 `cron.auto_install` 只服务已删除的 Web 登录/生命周期；其余列出的字段未被转存核心读取。新版本会明确拒绝这些遗留项。正则规则应放到每个任务的 `regex_pattern`/`regex_replace`。
+3. 运行 `python cli.py validate`。无 `task_uid` 的订阅会在真正初始化存储时生成稳定标识。
+4. 先运行一次 `python cli.py run --task <order>` 核对目标目录、正则与日志。
+5. 确认后改用 `python cli.py daemon` 或 Docker Compose。
+
+Web 路由、端口 5000、会话认证、前端轮询/SSE 和在线任务编辑已删除，不提供兼容 HTTP 接口。
+
+## 开发验证
+
+```bash
+source .venv/bin/activate
+PYTHONPYCACHEPREFIX=/tmp/baidu-autosave-pycache python -m pytest -q
+PYTHONPYCACHEPREFIX=/tmp/baidu-autosave-pycache python -m compileall -q \
+  cli.py config_loader.py cron_utils.py progress_display.py runtime_logging.py \
+  runtime_state.py scheduler.py storage.py notify.py utils.py
+UV_CACHE_DIR=/tmp/baidu-autosave-uv-cache uv pip check
+```
+
+真实百度 API 的端到端测试需要有效 Cookies 和分享链接，不应在公共 CI 中使用真实凭据。
+
+## 许可证与致谢
+
+项目使用 AGPL-3.0 许可证（见 `LICENSE`）。核心依赖包括 APScheduler、baidupcs-py、Loguru 和 tqdm。
